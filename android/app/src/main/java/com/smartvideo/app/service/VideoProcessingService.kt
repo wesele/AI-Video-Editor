@@ -5,12 +5,15 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.smartvideo.app.MainActivity
 import com.smartvideo.app.R
 import com.smartvideo.app.SmartVideoApp
@@ -82,7 +85,7 @@ class VideoProcessingService : Service() {
     ) {
         acquireWakeLock()
         val notification = createNotification("正在准备视频分析...", 0)
-        startForeground(1001, notification)
+        safeStartForeground(notification)
 
         serviceScope.launch {
             try {
@@ -180,7 +183,7 @@ class VideoProcessingService : Service() {
     ) {
         acquireWakeLock()
         val notification = createNotification("正在准备视频合成导出...", 0)
-        startForeground(1001, notification)
+        safeStartForeground(notification)
 
         serviceScope.launch {
             try {
@@ -210,8 +213,27 @@ class VideoProcessingService : Service() {
                 _statusFlow.value = ProcessStatus.Error(errMsg)
             } finally {
                 releaseWakeLock()
-                stopForeground(STOP_FOREGROUND_DETACH)
+                try {
+                    stopForeground(STOP_FOREGROUND_DETACH)
+                } catch (_: Exception) {}
             }
+        }
+    }
+
+    private fun safeStartForeground(notification: Notification) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceCompat.startForeground(
+                    this,
+                    1001,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(1001, notification)
+            }
+        } catch (e: Exception) {
+            Log.e("VideoProcessingService", "safeStartForeground warning: ${e.message}", e)
         }
     }
 
@@ -227,7 +249,7 @@ class VideoProcessingService : Service() {
         return NotificationCompat.Builder(this, SmartVideoApp.CHANNEL_ID)
             .setContentTitle("SmartVideo AI 剪辑处理中")
             .setContentText(contentText)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setProgress(100, progress, progress == 0)
@@ -236,8 +258,12 @@ class VideoProcessingService : Service() {
     }
 
     private fun updateNotification(contentText: String, progress: Int) {
-        val notification = createNotification(contentText, progress)
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        manager.notify(1001, notification)
+        try {
+            val notification = createNotification(contentText, progress)
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            manager.notify(1001, notification)
+        } catch (e: Exception) {
+            Log.w("VideoProcessingService", "updateNotification failed: ${e.message}")
+        }
     }
 }

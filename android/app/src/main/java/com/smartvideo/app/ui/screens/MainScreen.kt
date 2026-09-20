@@ -358,12 +358,17 @@ fun MainScreen(
                             val isAnalyzing = processStatus is ProcessStatus.Analyzing
                             Button(
                                 onClick = {
-                                    service?.startAnalysis(
-                                        videoUri = videoMeta!!.uri,
-                                        settings = settings,
-                                        styleInstruction = selectedStylePreset,
-                                        customPrompt = customPrompt
-                                    )
+                                    try {
+                                        service?.startAnalysis(
+                                            videoUri = videoMeta!!.uri,
+                                            settings = settings,
+                                            styleInstruction = selectedStylePreset,
+                                            customPrompt = customPrompt
+                                        )
+                                    } catch (e: Throwable) {
+                                        e.printStackTrace()
+                                        Toast.makeText(context, "启动分析失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                                    }
                                 },
                                 enabled = !isAnalyzing,
                                 modifier = Modifier

@@ -46,51 +46,51 @@ class Media3Engine(private val context: Context) {
         val deferred = CompletableDeferred<File>()
 
         mainHandler.post {
-            val clippingConfig = MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionMs(startMs)
-                .setEndPositionMs(endMs)
-                .build()
-
-            val mediaItem = MediaItem.Builder()
-                .setUri(videoUri)
-                .setClippingConfiguration(clippingConfig)
-                .build()
-
-            // 硬件降采样至 640x360 以保证极速 Base64 上传与低内存占用
-            val presentationEffect = Presentation.createForWidthAndHeight(
-                640,
-                360,
-                Presentation.LAYOUT_SCALE_TO_FIT
-            )
-            val effects = Effects(listOf(), listOf<Effect>(presentationEffect))
-
-            val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-                .setEffects(effects)
-                .setRemoveAudio(false)
-                .build()
-
-            val transformer = Transformer.Builder(context)
-                .setVideoMimeType(MimeTypes.VIDEO_H264)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                .addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        deferred.complete(tempFile)
-                    }
-
-                    override fun onError(
-                        composition: Composition,
-                        exportResult: ExportResult,
-                        exportException: ExportException
-                    ) {
-                        deferred.completeExceptionally(exportException)
-                    }
-                })
-                .build()
-
             try {
+                val clippingConfig = MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(startMs)
+                    .setEndPositionMs(endMs)
+                    .build()
+
+                val mediaItem = MediaItem.Builder()
+                    .setUri(videoUri)
+                    .setClippingConfiguration(clippingConfig)
+                    .build()
+
+                // 硬件降采样至 640x360 以保证极速 Base64 上传与低内存占用
+                val presentationEffect = Presentation.createForWidthAndHeight(
+                    640,
+                    360,
+                    Presentation.LAYOUT_SCALE_TO_FIT
+                )
+                val effects = Effects(listOf(), listOf<Effect>(presentationEffect))
+
+                val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                    .setEffects(effects)
+                    .setRemoveAudio(false)
+                    .build()
+
+                val transformer = Transformer.Builder(context)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            deferred.complete(tempFile)
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            deferred.completeExceptionally(exportException)
+                        }
+                    })
+                    .build()
+
                 transformer.start(editedMediaItem, tempFile.absolutePath)
-            } catch (e: Exception) {
-                deferred.completeExceptionally(e)
+            } catch (t: Throwable) {
+                deferred.completeExceptionally(t)
             }
         }
 
@@ -120,61 +120,61 @@ class Media3Engine(private val context: Context) {
         val deferred = CompletableDeferred<File>()
 
         mainHandler.post {
-            val editedMediaItemList = mutableListOf<EditedMediaItem>()
-
-            for (seg in validSegments) {
-                val startMs = (seg.startTime * 1000).toLong()
-                val endMs = (seg.endTime * 1000).toLong()
-
-                val clippingConfig = MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(startMs)
-                    .setEndPositionMs(endMs)
-                    .build()
-
-                val mediaItem = MediaItem.Builder()
-                    .setUri(videoUri)
-                    .setClippingConfiguration(clippingConfig)
-                    .build()
-
-                val shouldMute = seg.isFastForward && muteFastForwardAudio
-
-                val item = EditedMediaItem.Builder(mediaItem)
-                    .setRemoveAudio(shouldMute)
-                    .build()
-
-                editedMediaItemList.add(item)
-            }
-
-            val sequence = EditedMediaItemSequence(editedMediaItemList)
-            val composition = Composition.Builder(listOf(sequence)).build()
-
-            var transformerRef: Transformer? = null
-            val listener = object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    deferred.complete(tempOutput)
-                }
-
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    deferred.completeExceptionally(exportException)
-                }
-            }
-
-            val transformer = Transformer.Builder(context)
-                .setVideoMimeType(MimeTypes.VIDEO_H264)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                .addListener(listener)
-                .build()
-
-            transformerRef = transformer
-
             try {
+                val editedMediaItemList = mutableListOf<EditedMediaItem>()
+
+                for (seg in validSegments) {
+                    val startMs = (seg.startTime * 1000).toLong()
+                    val endMs = (seg.endTime * 1000).toLong()
+
+                    val clippingConfig = MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(startMs)
+                        .setEndPositionMs(endMs)
+                        .build()
+
+                    val mediaItem = MediaItem.Builder()
+                        .setUri(videoUri)
+                        .setClippingConfiguration(clippingConfig)
+                        .build()
+
+                    val shouldMute = seg.isFastForward && muteFastForwardAudio
+
+                    val item = EditedMediaItem.Builder(mediaItem)
+                        .setRemoveAudio(shouldMute)
+                        .build()
+
+                    editedMediaItemList.add(item)
+                }
+
+                val sequence = EditedMediaItemSequence(editedMediaItemList)
+                val composition = Composition.Builder(listOf(sequence)).build()
+
+                var transformerRef: Transformer? = null
+                val listener = object : Transformer.Listener {
+                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        deferred.complete(tempOutput)
+                    }
+
+                    override fun onError(
+                        composition: Composition,
+                        exportResult: ExportResult,
+                        exportException: ExportException
+                    ) {
+                        deferred.completeExceptionally(exportException)
+                    }
+                }
+
+                val transformer = Transformer.Builder(context)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .addListener(listener)
+                    .build()
+
+                transformerRef = transformer
+
                 transformer.start(composition, tempOutput.absolutePath)
-            } catch (e: Exception) {
-                deferred.completeExceptionally(e)
+            } catch (t: Throwable) {
+                deferred.completeExceptionally(t)
             }
         }
 
