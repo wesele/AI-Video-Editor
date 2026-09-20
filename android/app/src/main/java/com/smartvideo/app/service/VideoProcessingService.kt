@@ -102,15 +102,22 @@ class VideoProcessingService : Service() {
                     throw IllegalArgumentException("无法获取有效视频时长")
                 }
 
-                // 拆解为 60 秒窗口的切片以保持极低内存占用与高并发稳定性
-                val chunkWindow = 60.0
+                // 采用 90 秒动态切片与 2fps 超轻量代理，显著减少分段往返开销
+                val chunkWindow = 90.0
                 val totalChunks = Math.max(1, Math.ceil(totalDur / chunkWindow).toInt())
                 val allStage1Segments = mutableListOf<Segment>()
                 val isPortrait = meta.width < meta.height
 
                 // ==========================================
-                // Stage 1: 分段视听事实提取
+                // Stage 1: 分段视听事实提取（流水线预转码并行架构）
                 // ==========================================
+                // 预先启动第 1 段的切片代理转码
+                var nextProxyDeferred: Deferred<File>? = serviceScope.async(Dispatchers.IO) {
+                    val st = 0.0
+                    val et = Math.min(totalDur, chunkWindow)
+                    media3Engine.sliceChunkProxy(videoUri, st, et, 0, isPortrait)
+                }
+
                 for (idx in 0 until totalChunks) {
                     val st = idx * chunkWindow
                     val et = Math.min(totalDur, (idx + 1) * chunkWindow)
@@ -120,10 +127,10 @@ class VideoProcessingService : Service() {
                     updateNotification(msg, progress.toInt())
                     _statusFlow.value = ProcessStatus.Analyzing(1, progress, msg, allStage1Segments.toList())
 
-                    // 1. Android 原生 Media3 Transformer 剪切极速 360p 代理
-                    val proxyFile = media3Engine.sliceChunkProxy(videoUri, st, et, idx, isPortrait)
+                    // 1. 获取当前段的切片代理文件（若已在流水线后台转码完成，此处为 0 耗时即取）
+                    val proxyFile = nextProxyDeferred!!.await()
 
-                    // 2. 转 Base64（在 IO 协程中执行，避免占用主线程并及时释放内存）
+                    // 2. 转 Base64（超轻量 2fps 视频仅几百 KB，瞬时处理）
                     val videoB64 = withContext(Dispatchers.IO) {
                         val videoBytes = proxyFile.readBytes()
                         val b64 = Base64.encodeToString(videoBytes, Base64.NO_WRAP)
@@ -131,7 +138,17 @@ class VideoProcessingService : Service() {
                         b64
                     }
 
-                    // 3. 请求 Gemini 事实抽取
+                    // 3. 关键流水线优化：在当前段发起 Gemini 远程分析的同时，硬件后台并行预转码下一段！
+                    val nextIdx = idx + 1
+                    nextProxyDeferred = if (nextIdx < totalChunks) {
+                        serviceScope.async(Dispatchers.IO) {
+                            val nst = nextIdx * chunkWindow
+                            val net = Math.min(totalDur, (nextIdx + 1) * chunkWindow)
+                            media3Engine.sliceChunkProxy(videoUri, nst, net, nextIdx, isPortrait)
+                        }
+                    } else null
+
+                    // 4. 请求 Gemini 事实抽取（与下一段预转码硬件完全并行）
                     val chunkSegments = geminiClient.extractChunkFacts(
                         modelName = settings.defaultModel,
                         videoBase64 = videoB64,
