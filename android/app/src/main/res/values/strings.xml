@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SmartVideo</string>
+    <string name="channel_name">视频处理服务</string>
+    <string name="channel_desc">用于后台执行视频切片、Gemini AI 分析与视频合成导出</string>
+</resources>

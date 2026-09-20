@@ -1,0 +1,59 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.pytest_cache/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Android build outputs & caches
+.gradle/
+**/build/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.cxx/
+android/**/.externalNativeBuild/
+*.apk
+*.ap_
+*.aab
+
+# Media & Temp data
+data/uploads/*
+!data/uploads/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+data/temp/*
+!data/temp/.gitkeep
+temp/
+*.mp4
+*.mov
+*.m4v
+*.mkv
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

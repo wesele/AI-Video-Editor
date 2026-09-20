@@ -1,0 +1,243 @@
+package com.smartvideo.app.service
+
+import android.app.Notification
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import androidx.core.app.NotificationCompat
+import com.smartvideo.app.MainActivity
+import com.smartvideo.app.R
+import com.smartvideo.app.SmartVideoApp
+import com.smartvideo.app.data.api.GeminiApiClient
+import com.smartvideo.app.data.model.AppSettings
+import com.smartvideo.app.data.model.Segment
+import com.smartvideo.app.media.Media3Engine
+import com.smartvideo.app.media.VideoMetadataHelper
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
+import android.util.Base64
+
+sealed class ProcessStatus {
+    object Idle : ProcessStatus()
+    data class Analyzing(val step: Int, val progress: Float, val message: String, val partialSegments: List<Segment>) : ProcessStatus()
+    data class AnalysisCompleted(val segments: List<Segment>) : ProcessStatus()
+    data class Exporting(val progress: Float, val message: String) : ProcessStatus()
+    data class ExportCompleted(val outputUri: Uri) : ProcessStatus()
+    data class Error(val message: String) : ProcessStatus()
+}
+
+class VideoProcessingService : Service() {
+
+    private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    private val _statusFlow = MutableStateFlow<ProcessStatus>(ProcessStatus.Idle)
+    val statusFlow: StateFlow<ProcessStatus> = _statusFlow.asStateFlow()
+
+    inner class LocalBinder : Binder() {
+        fun getService(): VideoProcessingService = this@VideoProcessingService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SmartVideo:ProcessingWakeLock")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
+        releaseWakeLock()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == false) {
+            wakeLock?.acquire(3600 * 1000L) // Max 1 hour
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
+    }
+
+    fun startAnalysis(
+        videoUri: Uri,
+        settings: AppSettings,
+        styleInstruction: String = "通用剪辑",
+        customPrompt: String = ""
+    ) {
+        acquireWakeLock()
+        val notification = createNotification("正在准备视频分析...", 0)
+        startForeground(1001, notification)
+
+        serviceScope.launch {
+            try {
+                val media3Engine = Media3Engine(applicationContext)
+                val geminiClient = GeminiApiClient(settings.geminiBaseUrl, settings.geminiApiKey)
+                val meta = VideoMetadataHelper.extractMetadata(applicationContext, videoUri)
+                val totalDur = meta.durationSec
+
+                if (totalDur <= 0) {
+                    throw IllegalArgumentException("无法获取有效视频时长")
+                }
+
+                // 拆解为 180 秒窗口的切片
+                val chunkWindow = 180.0
+                val totalChunks = Math.max(1, Math.ceil(totalDur / chunkWindow).toInt())
+                val allStage1Segments = mutableListOf<Segment>()
+
+                // ==========================================
+                // Stage 1: 分段视听事实提取
+                // ==========================================
+                for (idx in 0 until totalChunks) {
+                    val st = idx * chunkWindow
+                    val et = Math.min(totalDur, (idx + 1) * chunkWindow)
+
+                    val msg = "[第 1 步 事实提取] 正在分析第 ${idx + 1}/$totalChunks 段..."
+                    val progress = ((idx.toFloat() / totalChunks) * 75f)
+                    updateNotification(msg, progress.toInt())
+                    _statusFlow.value = ProcessStatus.Analyzing(1, progress, msg, allStage1Segments.toList())
+
+                    // 1. Android 原生 Media3 Transformer 剪切极速 360p 代理
+                    val proxyFile = media3Engine.sliceChunkProxy(videoUri, st, et, idx)
+
+                    // 2. 转 Base64
+                    val videoBytes = withContext(Dispatchers.IO) { proxyFile.readBytes() }
+                    val videoB64 = Base64.encodeToString(videoBytes, Base64.NO_WRAP)
+                    if (proxyFile.exists()) proxyFile.delete()
+
+                    // 3. 请求 Gemini 事实抽取
+                    val chunkSegments = geminiClient.extractChunkFacts(
+                        modelName = settings.defaultModel,
+                        videoBase64 = videoB64,
+                        chunkIndex = idx,
+                        totalChunks = totalChunks,
+                        startTime = st,
+                        endTime = et,
+                        styleInstruction = styleInstruction,
+                        customPrompt = customPrompt
+                    )
+                    allStage1Segments.addAll(chunkSegments)
+
+                    val doneMsg = "[第 1 步 事实提取] 第 ${idx + 1}/$totalChunks 段完成，已提取 ${allStage1Segments.size} 个事实事件"
+                    val donePct = (((idx + 1).toFloat() / totalChunks) * 75f)
+                    updateNotification(doneMsg, donePct.toInt())
+                    _statusFlow.value = ProcessStatus.Analyzing(1, donePct, doneMsg, allStage1Segments.toList())
+                }
+
+                // ==========================================
+                // Stage 2: 全片全局二次宏观研读与 1-10 分价值曲线计算
+                // ==========================================
+                val s2Msg = "[第 2 步 全局宏观研读] Gemini 正在通盘审视全片并生成 1-10 分价值曲线..."
+                updateNotification(s2Msg, 80)
+                _statusFlow.value = ProcessStatus.Analyzing(2, 80f, s2Msg, allStage1Segments.toList())
+
+                val finalScoredSegments = geminiClient.globalMacroScore(
+                    modelName = settings.defaultModel,
+                    totalDuration = totalDur,
+                    stage1Segments = allStage1Segments,
+                    styleInstruction = styleInstruction,
+                    customPrompt = customPrompt,
+                    defaultFfSpeed = settings.defaultFfSpeed
+                )
+
+                val finishMsg = "大模型全局宏观研读完成！共生成 ${finalScoredSegments.size} 个剪辑分段"
+                updateNotification(finishMsg, 100)
+                _statusFlow.value = ProcessStatus.AnalysisCompleted(finalScoredSegments)
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+                val errMsg = "分析失败: ${e.localizedMessage ?: e.message}"
+                updateNotification(errMsg, 0)
+                _statusFlow.value = ProcessStatus.Error(errMsg)
+            } finally {
+                releaseWakeLock()
+                stopForeground(STOP_FOREGROUND_DETACH)
+            }
+        }
+    }
+
+    fun startExport(
+        videoUri: Uri,
+        segments: List<Segment>,
+        targetWidth: Int = 1280,
+        targetHeight: Int = 720,
+        muteFastForwardAudio: Boolean = false
+    ) {
+        acquireWakeLock()
+        val notification = createNotification("正在准备视频合成导出...", 0)
+        startForeground(1001, notification)
+
+        serviceScope.launch {
+            try {
+                val media3Engine = Media3Engine(applicationContext)
+                updateNotification("正在通过系统硬件 MediaCodec 极速变速拼接成片...", 20)
+                _statusFlow.value = ProcessStatus.Exporting(20f, "正在拼接保留段与加速快进段...")
+
+                val savedUri = media3Engine.exportComposition(
+                    videoUri = videoUri,
+                    segments = segments,
+                    targetWidth = targetWidth,
+                    targetHeight = targetHeight,
+                    muteFastForwardAudio = muteFastForwardAudio
+                ) { pct ->
+                    val p = (20f + pct * 0.8f).toInt()
+                    updateNotification("成片合成导出中: $p%", p)
+                    _statusFlow.value = ProcessStatus.Exporting(p.toFloat(), "成片合成导出中...")
+                }
+
+                updateNotification("视频导出成功！已存入系统相册 Movies/SmartVideo", 100)
+                _statusFlow.value = ProcessStatus.ExportCompleted(savedUri)
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+                val errMsg = "导出失败: ${e.localizedMessage ?: e.message}"
+                updateNotification(errMsg, 0)
+                _statusFlow.value = ProcessStatus.Error(errMsg)
+            } finally {
+                releaseWakeLock()
+                stopForeground(STOP_FOREGROUND_DETACH)
+            }
+        }
+    }
+
+    private fun createNotification(contentText: String, progress: Int): Notification {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, SmartVideoApp.CHANNEL_ID)
+            .setContentTitle("SmartVideo AI 剪辑处理中")
+            .setContentText(contentText)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setProgress(100, progress, progress == 0)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun updateNotification(contentText: String, progress: Int) {
+        val notification = createNotification(contentText, progress)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        manager.notify(1001, notification)
+    }
+}
