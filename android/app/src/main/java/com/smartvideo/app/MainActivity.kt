@@ -69,7 +69,6 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         val intent = Intent(this, VideoProcessingService::class.java)
-        startService(intent) // Ensure service lifecycle
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 

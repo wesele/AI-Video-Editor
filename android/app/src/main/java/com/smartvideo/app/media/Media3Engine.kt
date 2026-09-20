@@ -35,7 +35,8 @@ class Media3Engine(private val context: Context) {
         videoUri: Uri,
         startTimeSec: Double,
         endTimeSec: Double,
-        chunkIndex: Int
+        chunkIndex: Int,
+        isPortrait: Boolean = false
     ): File = withContext(Dispatchers.IO) {
         val tempFile = File(context.cacheDir, "proxy_chunk_${chunkIndex}_${System.currentTimeMillis()}.mp4")
         if (tempFile.exists()) tempFile.delete()
@@ -57,10 +58,12 @@ class Media3Engine(private val context: Context) {
                     .setClippingConfiguration(clippingConfig)
                     .build()
 
-                // 硬件降采样至 640x360 以保证极速 Base64 上传与低内存占用
+                // 根据横竖屏动态设置分辨率（竖屏 360x640，横屏 640x360），硬件降采样极速处理
+                val targetW = if (isPortrait) 360 else 640
+                val targetH = if (isPortrait) 640 else 360
                 val presentationEffect = Presentation.createForWidthAndHeight(
-                    640,
-                    360,
+                    targetW,
+                    targetH,
                     Presentation.LAYOUT_SCALE_TO_FIT
                 )
                 val effects = Effects(listOf(), listOf<Effect>(presentationEffect))
@@ -70,9 +73,15 @@ class Media3Engine(private val context: Context) {
                     .setRemoveAudio(false)
                     .build()
 
+                // 开启硬件编码器回退容错，确保各类真机芯片组（高通/联发科/三星）平稳运行
+                val encoderFactory = DefaultEncoderFactory.Builder(context)
+                    .setEnableFallback(true)
+                    .build()
+
                 val transformer = Transformer.Builder(context)
                     .setVideoMimeType(MimeTypes.VIDEO_H264)
                     .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .setEncoderFactory(encoderFactory)
                     .addListener(object : Transformer.Listener {
                         override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                             deferred.complete(tempFile)
@@ -164,9 +173,14 @@ class Media3Engine(private val context: Context) {
                     }
                 }
 
+                val encoderFactory = DefaultEncoderFactory.Builder(context)
+                    .setEnableFallback(true)
+                    .build()
+
                 val transformer = Transformer.Builder(context)
                     .setVideoMimeType(MimeTypes.VIDEO_H264)
                     .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .setEncoderFactory(encoderFactory)
                     .addListener(listener)
                     .build()
 

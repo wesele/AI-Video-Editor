@@ -41,7 +41,7 @@ sealed class ProcessStatus {
 class VideoProcessingService : Service() {
 
     private val binder = LocalBinder()
-    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var wakeLock: PowerManager.WakeLock? = null
 
     private val _statusFlow = MutableStateFlow<ProcessStatus>(ProcessStatus.Idle)
@@ -52,6 +52,10 @@ class VideoProcessingService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return START_NOT_STICKY
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -98,10 +102,11 @@ class VideoProcessingService : Service() {
                     throw IllegalArgumentException("无法获取有效视频时长")
                 }
 
-                // 拆解为 180 秒窗口的切片
-                val chunkWindow = 180.0
+                // 拆解为 60 秒窗口的切片以保持极低内存占用与高并发稳定性
+                val chunkWindow = 60.0
                 val totalChunks = Math.max(1, Math.ceil(totalDur / chunkWindow).toInt())
                 val allStage1Segments = mutableListOf<Segment>()
+                val isPortrait = meta.width < meta.height
 
                 // ==========================================
                 // Stage 1: 分段视听事实提取
@@ -116,12 +121,15 @@ class VideoProcessingService : Service() {
                     _statusFlow.value = ProcessStatus.Analyzing(1, progress, msg, allStage1Segments.toList())
 
                     // 1. Android 原生 Media3 Transformer 剪切极速 360p 代理
-                    val proxyFile = media3Engine.sliceChunkProxy(videoUri, st, et, idx)
+                    val proxyFile = media3Engine.sliceChunkProxy(videoUri, st, et, idx, isPortrait)
 
-                    // 2. 转 Base64
-                    val videoBytes = withContext(Dispatchers.IO) { proxyFile.readBytes() }
-                    val videoB64 = Base64.encodeToString(videoBytes, Base64.NO_WRAP)
-                    if (proxyFile.exists()) proxyFile.delete()
+                    // 2. 转 Base64（在 IO 协程中执行，避免占用主线程并及时释放内存）
+                    val videoB64 = withContext(Dispatchers.IO) {
+                        val videoBytes = proxyFile.readBytes()
+                        val b64 = Base64.encodeToString(videoBytes, Base64.NO_WRAP)
+                        if (proxyFile.exists()) proxyFile.delete()
+                        b64
+                    }
 
                     // 3. 请求 Gemini 事实抽取
                     val chunkSegments = geminiClient.extractChunkFacts(
@@ -135,6 +143,9 @@ class VideoProcessingService : Service() {
                         customPrompt = customPrompt
                     )
                     allStage1Segments.addAll(chunkSegments)
+
+                    // 提示 JVM 及时回收单段 Base64 占用的临时堆内存
+                    System.gc()
 
                     val doneMsg = "[第 1 步 事实提取] 第 ${idx + 1}/$totalChunks 段完成，已提取 ${allStage1Segments.size} 个事实事件"
                     val donePct = (((idx + 1).toFloat() / totalChunks) * 75f)
@@ -162,9 +173,9 @@ class VideoProcessingService : Service() {
                 updateNotification(finishMsg, 100)
                 _statusFlow.value = ProcessStatus.AnalysisCompleted(finalScoredSegments)
 
-            } catch (e: Exception) {
-                e.printStackTrace()
-                val errMsg = "分析失败: ${e.localizedMessage ?: e.message}"
+            } catch (t: Throwable) {
+                t.printStackTrace()
+                val errMsg = "分析失败: ${t.localizedMessage ?: t.message}"
                 updateNotification(errMsg, 0)
                 _statusFlow.value = ProcessStatus.Error(errMsg)
             } finally {
@@ -206,9 +217,9 @@ class VideoProcessingService : Service() {
                 updateNotification("视频导出成功！已存入系统相册 Movies/SmartVideo", 100)
                 _statusFlow.value = ProcessStatus.ExportCompleted(savedUri)
 
-            } catch (e: Exception) {
-                e.printStackTrace()
-                val errMsg = "导出失败: ${e.localizedMessage ?: e.message}"
+            } catch (t: Throwable) {
+                t.printStackTrace()
+                val errMsg = "导出失败: ${t.localizedMessage ?: t.message}"
                 updateNotification(errMsg, 0)
                 _statusFlow.value = ProcessStatus.Error(errMsg)
             } finally {
