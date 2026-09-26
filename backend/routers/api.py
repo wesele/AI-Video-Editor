@@ -86,11 +86,26 @@ async def upload_video(file: UploadFile = File(...)):
     return video_info
 
 async def _run_analysis(job_id: str, video_path: str, req: AnalyzeRequest):
+    init_progress = 0.0
+    init_msg = "正在初始化视频分析管线..."
+    init_segments = None
+
+    if req.resume:
+        ckpt = gemini_service.get_checkpoint(req.video_id)
+        if ckpt and ckpt.get("stage1_completed_chunks"):
+            init_segments = []
+            for c in ckpt["stage1_completed_chunks"]:
+                init_segments.extend(c.get("segments", []))
+            total_c = max(1, ckpt.get("total_chunks", 1))
+            done_c = len(ckpt["stage1_completed_chunks"])
+            init_progress = round((done_c / total_c) * 75.0, 1)
+            init_msg = f"正在从断点恢复...（已复用前 {done_c}/{total_c} 段）"
+
     analyze_jobs[job_id] = {
         "status": "processing",
-        "progress": 0.0,
-        "progress_message": "正在初始化视频分析管线...",
-        "segments": None,
+        "progress": init_progress,
+        "progress_message": init_msg,
+        "segments": init_segments,
         "error": None,
     }
 
@@ -104,10 +119,12 @@ async def _run_analysis(job_id: str, video_path: str, req: AnalyzeRequest):
     try:
         segments = await gemini_service.analyze_video(
             video_path=video_path,
+            video_id=req.video_id,
             model_name=req.model,
             style_preset=req.style_preset,
             custom_prompt=req.custom_prompt,
             default_ff_speed=req.default_fast_forward_speed,
+            resume=req.resume,
             progress_callback=on_progress,
         )
         analyze_jobs[job_id] = {
@@ -118,11 +135,18 @@ async def _run_analysis(job_id: str, video_path: str, req: AnalyzeRequest):
             "error": None,
         }
     except Exception as e:
+        prev_segs = analyze_jobs.get(job_id, {}).get("segments")
+        if not prev_segs:
+            ckpt = gemini_service.get_checkpoint(req.video_id)
+            if ckpt and ckpt.get("stage1_completed_chunks"):
+                prev_segs = []
+                for c in ckpt["stage1_completed_chunks"]:
+                    prev_segs.extend(c.get("segments", []))
         analyze_jobs[job_id] = {
             "status": "failed",
-            "progress": 0.0,
+            "progress": analyze_jobs.get(job_id, {}).get("progress", 0.0),
             "progress_message": f"分析失败: {str(e)}",
-            "segments": None,
+            "segments": prev_segs,
             "error": str(e),
         }
 
@@ -173,6 +197,30 @@ async def get_analyze_status(job_id: str):
     if job_id not in analyze_jobs:
         raise HTTPException(status_code=404, detail="分析任务不存在")
     return analyze_jobs[job_id]
+
+@router.get("/video/analyze/checkpoint")
+async def get_checkpoint_api(video_id: Optional[str] = None):
+    ckpt = gemini_service.get_checkpoint(video_id)
+    if not ckpt:
+        return {"has_checkpoint": False, "checkpoint": None, "partial_segments": []}
+
+    partial_segments = []
+    if ckpt.get("stage1_completed_chunks"):
+        for c in ckpt["stage1_completed_chunks"]:
+            partial_segments.extend(c.get("segments", []))
+    elif ckpt.get("final_segments"):
+        partial_segments = ckpt["final_segments"]
+
+    return {
+        "has_checkpoint": True,
+        "checkpoint": ckpt,
+        "partial_segments": partial_segments,
+    }
+
+@router.delete("/video/analyze/checkpoint")
+async def clear_checkpoint_api():
+    gemini_service.clear_checkpoint()
+    return {"status": "ok", "message": "断点已清理"}
 
 async def _run_export(
     task_id: str,

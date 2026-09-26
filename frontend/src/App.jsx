@@ -94,6 +94,15 @@ export default function App() {
     setSelectedSegmentId(null);
   };
 
+  const handlePartialUpdate = (partial) => {
+    if (!partial || partial.length === 0) return;
+    setSegments(partial);
+    setSelectedSegmentId(prev => {
+      const exists = partial.some(s => s.id === prev);
+      return exists ? prev : partial[0]?.id;
+    });
+  };
+
   const handleAnalysisComplete = (newSegments) => {
     const thresholded = applyThresholdToSegments(scoreThreshold, belowThresholdSpeed, deleteLowScore, newSegments);
     setSegments(thresholded);
@@ -183,7 +192,7 @@ export default function App() {
             <GeminiPanel
               videoMeta={videoMeta}
               onAnalysisComplete={handleAnalysisComplete}
-              onPartialUpdate={setSegments}
+              onPartialUpdate={handlePartialUpdate}
               systemStatus={systemStatus}
             />
 

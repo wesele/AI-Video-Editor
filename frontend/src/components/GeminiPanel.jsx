@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Sparkles, Play, RefreshCw, Wand2, Compass, Gamepad2, BookOpen, Users, Sliders } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Sparkles, Play, RefreshCw, Wand2, Compass, Gamepad2, BookOpen, Users, Sliders, AlertCircle } from 'lucide-react';
 import axios from 'axios';
 
 const styles = [
@@ -21,6 +21,45 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
   const [elapsedSec, setElapsedSec] = useState(0);
   const [streamedCount, setStreamedCount] = useState(0);
   const [errorMsg, setErrorMsg] = useState('');
+  const [checkpointInfo, setCheckpointInfo] = useState(null);
+
+  const fetchCheckpoint = async (vid) => {
+    if (!vid) return;
+    try {
+      const res = await axios.get(`/api/video/analyze/checkpoint?video_id=${vid}`);
+      if (res.data?.has_checkpoint && res.data.checkpoint?.video_id === vid) {
+        setCheckpointInfo(res.data);
+        if (res.data.checkpoint?.config) {
+          const cfg = res.data.checkpoint.config;
+          if (cfg.model) setModel(cfg.model);
+          if (cfg.style_preset) setStylePreset(cfg.style_preset);
+          if (cfg.custom_prompt !== undefined) setCustomPrompt(cfg.custom_prompt);
+          if (cfg.default_fast_forward_speed) setDefaultSpeed(cfg.default_fast_forward_speed);
+        }
+        if (res.data.partial_segments && res.data.partial_segments.length > 0) {
+          setStreamedCount(res.data.partial_segments.length);
+          if (onPartialUpdate) {
+            onPartialUpdate(res.data.partial_segments);
+          }
+        }
+        if (res.data.checkpoint.status === 'failed' && res.data.checkpoint.error_message) {
+          setErrorMsg(res.data.checkpoint.error_message);
+        }
+      } else {
+        setCheckpointInfo(null);
+      }
+    } catch (e) {
+      console.warn('查询断点失败', e);
+    }
+  };
+
+  useEffect(() => {
+    if (videoMeta?.video_id) {
+      fetchCheckpoint(videoMeta.video_id);
+    } else {
+      setCheckpointInfo(null);
+    }
+  }, [videoMeta?.video_id]);
 
   const formatTimer = (sec) => {
     const m = Math.floor(sec / 60);
@@ -28,14 +67,23 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  const handleStartAnalyze = async () => {
+  const handleStartAnalyze = async (resume = false) => {
     if (!videoMeta) return;
     setAnalyzing(true);
-    setProgress(0);
-    setElapsedSec(0);
-    setStreamedCount(0);
     setErrorMsg('');
-    setStatusText('正在初始化视频分析任务...');
+
+    let initialPct = 0;
+    let initialMsg = '正在初始化视频分析任务...';
+    if (resume && checkpointInfo?.checkpoint?.stage1_completed_chunks) {
+      const done = checkpointInfo.checkpoint.stage1_completed_chunks.length;
+      const total = checkpointInfo.checkpoint.total_chunks || 1;
+      initialPct = Math.round((done / total) * 75);
+      initialMsg = `正在从断点恢复...（已复用前 ${done}/${total} 段事实）`;
+    }
+
+    setProgress(initialPct);
+    setStatusText(initialMsg);
+    setElapsedSec(0);
 
     // Start timer ticker
     const timerInterval = setInterval(() => {
@@ -49,6 +97,7 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
         style_preset: stylePreset,
         custom_prompt: customPrompt,
         default_fast_forward_speed: defaultSpeed,
+        resume: resume,
       });
 
       const jobId = initRes.data.job_id;
@@ -74,18 +123,21 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
             setProgress(100);
             setStatusText(data.progress_message || '分析完成！');
             setAnalyzing(false);
+            setCheckpointInfo(null);
             onAnalysisComplete(data.segments);
           } else if (data.status === 'failed') {
             clearInterval(pollInterval);
             clearInterval(timerInterval);
             setAnalyzing(false);
             setErrorMsg(data.error || '分析失败');
+            fetchCheckpoint(videoMeta.video_id);
           }
         } catch (pollErr) {
           clearInterval(pollInterval);
           clearInterval(timerInterval);
           setAnalyzing(false);
           setErrorMsg('获取分析状态失败: ' + pollErr.message);
+          fetchCheckpoint(videoMeta.video_id);
         }
       }, 1000);
 
@@ -93,6 +145,7 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
       clearInterval(timerInterval);
       setAnalyzing(false);
       setErrorMsg('触发 AI 分析失败: ' + (e.response?.data?.detail || e.message));
+      fetchCheckpoint(videoMeta.video_id);
     }
   };
 
@@ -202,8 +255,13 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
       </div>
 
       {errorMsg && (
-        <div className="p-3.5 bg-rose-500/10 border border-rose-500/20 text-rose-300 rounded-xl text-xs">
-          {errorMsg}
+        <div className="p-3.5 bg-rose-500/10 border border-rose-500/20 text-rose-300 rounded-xl text-xs flex items-start gap-2.5">
+          <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          <div>
+            <div className="font-semibold text-rose-200">粗剪处理中断</div>
+            <div className="text-rose-300/90 mt-0.5">{errorMsg}</div>
+            <div className="text-slate-400 text-[11px] mt-1">已分析成功的前序分段已完整保留在下方时间轴，您可以直接点击「继续处理」断点续跑。</div>
+          </div>
         </div>
       )}
 
@@ -279,19 +337,58 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
             </div>
           </div>
         ) : (
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-            <div className="text-xs text-slate-400">
-              点击后 Gemini 将自动研读整段视频并生成连续的分段剪辑方案（支持超长视频秒级精准切片）
-            </div>
+          <div>
+            {checkpointInfo?.has_checkpoint && checkpointInfo.checkpoint?.status !== 'success' ? (
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 rounded-xl bg-slate-950/60 border border-sky-500/20">
+                <div className="text-xs text-slate-300 space-y-1">
+                  <div className="flex items-center gap-1.5 text-sky-400 font-semibold">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>检测到可恢复的粗剪断点</span>
+                  </div>
+                  <div className="text-slate-400 text-[11px]">
+                    已完成前 {checkpointInfo.checkpoint.stage1_completed_chunks?.length || 0}/{checkpointInfo.checkpoint.total_chunks || 0} 段分析（已在下方时间轴载入 {checkpointInfo.partial_segments?.length || 0} 个事件）
+                  </div>
+                </div>
 
-            <button
-              onClick={handleStartAnalyze}
-              disabled={analyzing}
-              className="w-full sm:w-auto px-6 py-3 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white font-semibold rounded-xl text-sm shadow-lg shadow-sky-500/25 flex items-center justify-center space-x-2 transition disabled:opacity-50 cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4" />
-              <span>开始 Gemini 智能粗剪</span>
-            </button>
+                <div className="flex items-center gap-3 w-full sm:w-auto">
+                  <button
+                    onClick={() => handleStartAnalyze(false)}
+                    disabled={analyzing}
+                    className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-medium rounded-xl text-xs transition border border-slate-700 cursor-pointer"
+                  >
+                    重新开始
+                  </button>
+
+                  <button
+                    onClick={() => handleStartAnalyze(true)}
+                    disabled={analyzing}
+                    className="px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-sky-600 hover:from-emerald-400 hover:to-sky-500 text-white font-semibold rounded-xl text-xs shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2 transition cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>
+                      {checkpointInfo.checkpoint.failed_stage === 'stage2'
+                        ? '重试第二阶段（全局宏观研读）'
+                        : `继续处理（从第 ${(checkpointInfo.checkpoint.stage1_completed_chunks?.length || 0) + 1} 段继续）`}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="text-xs text-slate-400">
+                  点击后 Gemini 将自动研读整段视频并生成连续的分段剪辑方案（支持超长视频秒级精准切片与断点续跑）
+                </div>
+
+                <button
+                  onClick={() => handleStartAnalyze(false)}
+                  disabled={analyzing}
+                  className="w-full sm:w-auto px-6 py-3 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white font-semibold rounded-xl text-sm shadow-lg shadow-sky-500/25 flex items-center justify-center space-x-2 transition disabled:opacity-50 cursor-pointer"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>开始 Gemini 智能粗剪</span>
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

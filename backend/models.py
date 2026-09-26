@@ -32,6 +32,7 @@ class AnalyzeRequest(BaseModel):
     style_preset: str = "general"  # general, vlog, gaming, tutorial, meeting
     custom_prompt: Optional[str] = ""
     default_fast_forward_speed: float = 4.0
+    resume: bool = False
 
 class ExportRequest(BaseModel):
     video_id: str

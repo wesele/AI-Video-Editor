@@ -6,7 +6,7 @@ import asyncio
 import httpx
 import uuid
 from typing import Dict, Any, List, Optional
-from backend.config import get_settings
+from backend.config import get_settings, CHECKPOINT_FILE, CHECKPOINTS_DIR
 from backend.services.ffmpeg_service import ffmpeg_service
 
 STYLE_PROMPTS = {
@@ -43,13 +43,44 @@ STYLE_PROMPTS = {
 }
 
 class GeminiService:
+    def get_checkpoint(self, video_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if not CHECKPOINT_FILE.exists():
+            return None
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if video_id and data.get("video_id") != video_id:
+                return None
+            return data
+        except Exception:
+            return None
+
+    def save_checkpoint(self, checkpoint_data: Dict[str, Any]) -> None:
+        try:
+            CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+            temp_path = CHECKPOINT_FILE.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, CHECKPOINT_FILE)
+        except Exception as e:
+            print(f"写入检查点失败: {e}")
+
+    def clear_checkpoint(self) -> None:
+        try:
+            if CHECKPOINT_FILE.exists():
+                CHECKPOINT_FILE.unlink()
+        except Exception as e:
+            print(f"清除检查点失败: {e}")
+
     async def analyze_video(
         self,
         video_path: str,
+        video_id: str = "",
         model_name: str = "gemini-3.8-flash-high",
         style_preset: str = "general",
         custom_prompt: Optional[str] = "",
         default_ff_speed: float = 4.0,
+        resume: bool = False,
         progress_callback: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         settings = get_settings()
@@ -75,6 +106,45 @@ class GeminiService:
         total_chunks = len(chunks)
         all_segments: List[Dict[str, Any]] = []
 
+        # Checkpoint restoration or initialization
+        existing_ckpt = self.get_checkpoint(video_id)
+        if resume and existing_ckpt and existing_ckpt.get("video_id") == video_id:
+            checkpoint = existing_ckpt
+            stage1_completed = {c["chunk_index"]: c for c in checkpoint.get("stage1_completed_chunks", [])}
+            checkpoint["status"] = "processing"
+            checkpoint["failed_stage"] = None
+            checkpoint["failed_chunk_index"] = None
+            checkpoint["error_message"] = None
+            checkpoint["config"] = {
+                "model": model_name,
+                "style_preset": style_preset,
+                "custom_prompt": custom_prompt,
+                "default_fast_forward_speed": default_ff_speed,
+            }
+            self.save_checkpoint(checkpoint)
+        else:
+            stage1_completed = {}
+            checkpoint = {
+                "video_id": video_id,
+                "video_path": video_path,
+                "total_duration": total_duration,
+                "chunk_len": CHUNK_LEN,
+                "total_chunks": total_chunks,
+                "status": "processing",
+                "failed_stage": None,
+                "failed_chunk_index": None,
+                "error_message": None,
+                "config": {
+                    "model": model_name,
+                    "style_preset": style_preset,
+                    "custom_prompt": custom_prompt,
+                    "default_fast_forward_speed": default_ff_speed,
+                },
+                "stage1_completed_chunks": [],
+                "final_segments": None,
+            }
+            self.save_checkpoint(checkpoint)
+
         style_instruction = STYLE_PROMPTS.get(style_preset, STYLE_PROMPTS["general"])
         custom_part = f"\n【用户补充要求】：\n{custom_prompt.strip()}" if custom_prompt and custom_prompt.strip() else ""
         pure_model = model_name.replace("models/", "")
@@ -87,34 +157,49 @@ class GeminiService:
 
         for idx, (st, et) in enumerate(chunks):
             chunk_dur = round(et - st, 2)
-            chunk_pct_base = (idx / total_chunks) * 100.0
-            chunk_pct_slice = round(chunk_pct_base + (1.0 / total_chunks) * 20.0, 1)
-            chunk_pct_ai = round(chunk_pct_base + (1.0 / total_chunks) * 80.0, 1)
-            chunk_pct_done = round(((idx + 1) / total_chunks) * 100.0, 1)
+            if idx in stage1_completed:
+                norm_chunk = stage1_completed[idx]["segments"]
+                all_segments.extend(norm_chunk)
+                if progress_callback:
+                    pct = round(((idx + 1) / total_chunks) * 75.0, 1)
+                    progress_callback(
+                        pct,
+                        f"[第一步 事实提取] 已复用已保存的第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)})...",
+                        all_segments,
+                    )
+                continue
 
-            # Step A: Slice chunk to lightweight proxy (typically 2-4 MB)
             if progress_callback:
+                chunk_pct_slice = round((idx / total_chunks) * 75.0 + 1.0, 1)
                 progress_callback(
                     chunk_pct_slice,
                     f"正在切片第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)})...",
                     all_segments,
                 )
 
-            chunk_path = await ffmpeg_service.slice_chunk_proxy_async(video_path, st, et, idx)
+            # Auto-retry up to 3 times
+            last_err = None
+            norm_chunk = None
 
-            # Step B: Base64 encode chunk
-            with open(chunk_path, "rb") as f:
-                video_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-            # Clean up temp chunk file immediately
-            if os.path.exists(chunk_path):
+            for attempt in range(1, 4):
+                chunk_path = None
                 try:
-                    os.remove(chunk_path)
-                except Exception:
-                    pass
+                    # Step A: Slice chunk to lightweight proxy (typically 2-4 MB)
+                    chunk_path = await ffmpeg_service.slice_chunk_proxy_async(video_path, st, et, idx)
 
-            # Step C: Prompt for chunk factual extraction (Stage 1)
-            chunk_prompt = f"""你是一名顶级专业视频视听分析师。你正在分析视频的第 {idx+1}/{total_chunks} 分段。
+                    # Step B: Base64 encode chunk
+                    with open(chunk_path, "rb") as f:
+                        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+                    if os.path.exists(chunk_path):
+                        try:
+                            os.remove(chunk_path)
+                            chunk_path = None
+                        except Exception:
+                            pass
+
+                    # Step C: Prompt for chunk factual extraction (Stage 1)
+                    chunk_prompt = f"""你是一名顶级专业视频视听分析师。你正在分析视频的第 {idx+1}/{total_chunks} 分段。
 该分段在整片视频中的绝对时间范围是：【从 {st:.1f} 秒 到 {et:.1f} 秒】（本分段总时长 {chunk_dur:.1f} 秒）。
 你的任务是对这一时间区间内的视听事实信息进行全面细致的提取（用于后续全片全局宏观剪辑决策）：
 1. 观察画面场景环境、主体行为、关键动作（scene_desc）；
@@ -138,48 +223,78 @@ class GeminiService:
   - "action": 初步动作建议 ("keep" | "fast_forward" | "delete")
 """
 
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": chunk_prompt},
+                    payload = {
+                        "contents": [
                             {
-                                "inline_data": {
-                                    "mime_type": "video/mp4",
-                                    "data": video_b64
-                                }
+                                "parts": [
+                                    {"text": chunk_prompt},
+                                    {
+                                        "inline_data": {
+                                            "mime_type": "video/mp4",
+                                            "data": video_b64
+                                        }
+                                    }
+                                ]
                             }
-                        ]
+                        ],
+                        "generationConfig": {
+                            "response_mime_type": "application/json"
+                        }
                     }
-                ],
-                "generationConfig": {
-                    "response_mime_type": "application/json"
-                }
-            }
 
-            if progress_callback:
-                chunk_pct_ai = round((idx / total_chunks) * 75.0 + (0.8 / total_chunks) * 75.0, 1)
-                progress_callback(
-                    chunk_pct_ai,
-                    f"[第一步 事实提取] {pure_model} 正在分析第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)})...",
-                    all_segments,
-                )
+                    if progress_callback:
+                        chunk_pct_ai = round((idx / total_chunks) * 75.0 + (0.8 / total_chunks) * 75.0, 1)
+                        retry_suffix = f" (第{attempt}次重试)..." if attempt > 1 else "..."
+                        progress_callback(
+                            chunk_pct_ai,
+                            f"[第一步 事实提取] {pure_model} 正在分析第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)}){retry_suffix}",
+                            all_segments,
+                        )
 
-            # Step D: Request Gemini
-            raw_segments = []
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.post(endpoint, json=payload)
-                    if resp.status_code == 200:
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        resp = await client.post(endpoint, json=payload)
+                        if resp.status_code != 200:
+                            raise RuntimeError(f"Gemini API 响应异常 (HTTP {resp.status_code}): {resp.text[:200]}")
                         res_json = resp.json()
-                        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                        if "candidates" not in res_json or not res_json["candidates"]:
+                            raise RuntimeError("Gemini 返回候选内容为空")
+                        candidate = res_json["candidates"][0]
+                        if "content" not in candidate or "parts" not in candidate["content"]:
+                            raise RuntimeError("Gemini 返回数据结构异常")
+                        raw_text = candidate["content"]["parts"][0]["text"]
                         raw_segments = self._parse_json_segments(raw_text)
-            except Exception as e:
-                print(f"分段 {idx+1} 事实提取异常: {e}，启用智能保底")
 
-            # Step E: Normalize chunk segments to master timeline [st, et]
-            norm_chunk = self._normalize_chunk_timeline(raw_segments, st, et, default_ff_speed)
+                    norm_chunk = self._normalize_chunk_timeline(raw_segments, st, et, default_ff_speed)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f"分段 {idx+1}/{total_chunks} 第 {attempt} 次提取异常: {e}")
+                    if chunk_path and os.path.exists(chunk_path):
+                        try:
+                            os.remove(chunk_path)
+                        except Exception:
+                            pass
+                    if attempt < 3:
+                        await asyncio.sleep(attempt * 1.5)
+
+            if last_err is not None:
+                checkpoint["status"] = "failed"
+                checkpoint["failed_stage"] = "stage1"
+                checkpoint["failed_chunk_index"] = idx
+                checkpoint["error_message"] = str(last_err)
+                self.save_checkpoint(checkpoint)
+                raise RuntimeError(f"第 {idx+1}/{total_chunks} 段 ({fmt_time(st)}~{fmt_time(et)}) 事实提取失败: {str(last_err)}")
+
             all_segments.extend(norm_chunk)
+            checkpoint["stage1_completed_chunks"].append({
+                "chunk_index": idx,
+                "st": st,
+                "et": et,
+                "segments": norm_chunk,
+            })
+            checkpoint["status"] = "processing"
+            self.save_checkpoint(checkpoint)
 
             if progress_callback:
                 chunk_pct_done = round(((idx + 1) / total_chunks) * 75.0, 1)
@@ -200,20 +315,20 @@ class GeminiService:
             )
 
         final_segments = []
-        try:
-            # Build compact timeline events for Stage 2
-            compact_events = []
-            for s in all_segments:
-                compact_events.append({
-                    "start": round(s["start_time"], 1),
-                    "end": round(s["end_time"], 1),
-                    "summary": s.get("summary", "") or s.get("reason", ""),
-                    "scene": s.get("scene_desc", ""),
-                    "dialogue": s.get("dialogue", ""),
-                    "initial_score": s.get("score", 5.0)
-                })
+        last_err_s2 = None
 
-            step2_prompt = f"""你是一名顶级电影总剪辑师与总导演。
+        compact_events = []
+        for s in all_segments:
+            compact_events.append({
+                "start": round(s["start_time"], 1),
+                "end": round(s["end_time"], 1),
+                "summary": s.get("summary", "") or s.get("reason", ""),
+                "scene": s.get("scene_desc", ""),
+                "dialogue": s.get("dialogue", ""),
+                "initial_score": s.get("score", 5.0)
+            })
+
+        step2_prompt = f"""你是一名顶级电影总剪辑师与总导演。
 整部视频总时长为 {total_duration:.1f} 秒。第一阶段已提取出覆盖全片各个时段的事实事件清单如下：
 {json.dumps(compact_events, ensure_ascii=False, indent=1)}
 
@@ -241,30 +356,67 @@ class GeminiService:
   - "reason": 从全片全局视角的价值度判定理由
 """
 
-            step2_payload = {
-                "contents": [
-                    {
-                        "parts": [{"text": step2_prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "response_mime_type": "application/json"
+        step2_payload = {
+            "contents": [
+                {
+                    "parts": [{"text": step2_prompt}]
                 }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json"
             }
+        }
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp2 = await client.post(endpoint, json=step2_payload)
-                if resp2.status_code == 200:
+        for attempt in range(1, 4):
+            try:
+                if progress_callback and attempt > 1:
+                    progress_callback(
+                        80.0,
+                        f"[第二步 全局宏观研读] 正在重试第 {attempt} 次全局通盘审视...",
+                        all_segments,
+                    )
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp2 = await client.post(endpoint, json=step2_payload)
+                    if resp2.status_code != 200:
+                        raise RuntimeError(f"Gemini 全局打分接口响应异常 (HTTP {resp2.status_code}): {resp2.text[:200]}")
                     res2_json = resp2.json()
-                    raw_text2 = res2_json["candidates"][0]["content"]["parts"][0]["text"]
+                    if "candidates" not in res2_json or not res2_json["candidates"]:
+                        raise RuntimeError("Gemini 全局打分返回候选集为空")
+                    candidate2 = res2_json["candidates"][0]
+                    if "content" not in candidate2 or "parts" not in candidate2["content"]:
+                        raise RuntimeError("Gemini 全局打分返回结构异常")
+                    raw_text2 = candidate2["content"]["parts"][0]["text"]
                     scored_segments = self._parse_json_segments(raw_text2)
                     if scored_segments and len(scored_segments) > 0:
                         final_segments = self._normalize_timeline(scored_segments, total_duration, default_ff_speed)
-        except Exception as e2:
-            print(f"第二阶段全局价值打分异常: {e2}，回退至第一阶段平滑方案")
+                        last_err_s2 = None
+                        break
+                    else:
+                        raise RuntimeError("未能解析出有效的全局评分分段数据")
+            except Exception as e2:
+                last_err_s2 = e2
+                print(f"第二阶段全局价值打分第 {attempt} 次异常: {e2}")
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 1.5)
+
+        if last_err_s2 is not None:
+            checkpoint["status"] = "failed"
+            checkpoint["failed_stage"] = "stage2"
+            checkpoint["failed_chunk_index"] = None
+            checkpoint["error_message"] = str(last_err_s2)
+            self.save_checkpoint(checkpoint)
+            raise RuntimeError(f"第二阶段全局宏观审视打分失败: {str(last_err_s2)}")
 
         if not final_segments:
             final_segments = self._normalize_timeline(all_segments, total_duration, default_ff_speed)
+
+        # Stage 2 complete!
+        checkpoint["status"] = "success"
+        checkpoint["failed_stage"] = None
+        checkpoint["failed_chunk_index"] = None
+        checkpoint["error_message"] = None
+        checkpoint["final_segments"] = final_segments
+        self.save_checkpoint(checkpoint)
 
         if progress_callback:
             progress_callback(

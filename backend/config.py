@@ -7,12 +7,15 @@ DATA_DIR = BASE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 EXPORTS_DIR = DATA_DIR / "exports"
 TEMP_DIR = DATA_DIR / "temp"
+CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
+CHECKPOINT_FILE = CHECKPOINTS_DIR / "current_checkpoint.json"
 ENV_FILE = BASE_DIR / ".env"
 
 # Ensure directories exist
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Load existing .env if present
 if ENV_FILE.exists():
