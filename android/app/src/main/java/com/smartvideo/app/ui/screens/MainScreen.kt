@@ -1,11 +1,13 @@
 package com.smartvideo.app.ui.screens
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,6 +27,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.smartvideo.app.data.model.AnalysisResult
 import com.smartvideo.app.data.model.AppSettings
 import com.smartvideo.app.data.model.Segment
 import com.smartvideo.app.data.model.VideoMetadata
@@ -54,6 +57,7 @@ fun MainScreen(
 
     var isSettingsOpen by remember { mutableStateOf(false) }
     var isExportSheetOpen by remember { mutableStateOf(false) }
+    val playerSeekController = remember { PlayerSeekController() }
 
     // 监听后台服务执行状态
     val processStatus by service?.statusFlow?.collectAsState() ?: remember { mutableStateOf(ProcessStatus.Idle) }
@@ -86,34 +90,131 @@ fun MainScreen(
         if (uri != null) {
             val meta = VideoMetadataHelper.extractMetadata(context, uri)
             videoMeta = meta
-            val initialSeg = Segment(
-                startTime = 0.0,
-                endTime = meta.durationSec,
-                duration = meta.durationSec,
-                action = "keep",
-                speed = 1.0f,
-                score = 6.0f,
-                reason = "原始未剪辑完整视频",
-                summary = "完整素材"
-            )
-            segments = listOf(initialSeg)
+
+            // 智能感知：优先加载已永久落地的粗处理成果
+            val uriStr = uri.toString()
+            val savedResult = service?.getAnalysisResult(uriStr)
+            if (savedResult != null && savedResult.segments.isNotEmpty()) {
+                segments = applyThresholdToSegments(savedResult.segments, scoreThreshold, belowThresholdSpeed, deleteLowScore)
+                if (savedResult.styleInstruction.isNotEmpty()) selectedStylePreset = savedResult.styleInstruction
+                if (savedResult.customPrompt.isNotEmpty()) customPrompt = savedResult.customPrompt
+                Toast.makeText(context, "已载入已完成的历史粗剪成果 (共 ${savedResult.segments.size} 段)", Toast.LENGTH_LONG).show()
+            } else {
+                val savedCp = service?.getCheckpoint(uriStr)
+                if (savedCp != null && savedCp.stage1Segments.isNotEmpty()) {
+                    segments = applyThresholdToSegments(savedCp.stage1Segments, scoreThreshold, belowThresholdSpeed, deleteLowScore)
+                    if (savedCp.styleInstruction.isNotEmpty()) selectedStylePreset = savedCp.styleInstruction
+                    if (savedCp.customPrompt.isNotEmpty()) customPrompt = savedCp.customPrompt
+                } else {
+                    val initialSeg = Segment(
+                        startTime = 0.0,
+                        endTime = meta.durationSec,
+                        duration = meta.durationSec,
+                        action = "keep",
+                        speed = 1.0f,
+                        score = 6.0f,
+                        reason = "原始未剪辑完整视频",
+                        summary = "完整素材"
+                    )
+                    segments = listOf(initialSeg)
+                }
+            }
         }
     }
 
-    // 动态阈值变更时，毫秒级纯本地重划分段动作与测算
+    // 若本地存在已完成的历史成果或未完成的断点检查点，自动恢复分段与参数
+    LaunchedEffect(service, videoMeta) {
+        if (service != null && videoMeta != null && segments.size <= 1) {
+            val uriStr = videoMeta!!.uri.toString()
+            val savedResult = service.getAnalysisResult(uriStr)
+            if (savedResult != null && savedResult.segments.isNotEmpty()) {
+                segments = applyThresholdToSegments(savedResult.segments, scoreThreshold, belowThresholdSpeed, deleteLowScore)
+                if (savedResult.styleInstruction.isNotEmpty()) selectedStylePreset = savedResult.styleInstruction
+                if (savedResult.customPrompt.isNotEmpty()) customPrompt = savedResult.customPrompt
+                Toast.makeText(context, "已自动载入历史粗剪成果 (共 ${savedResult.segments.size} 段)", Toast.LENGTH_SHORT).show()
+            } else {
+                val cp = service.getCheckpoint(uriStr)
+                if (cp != null && cp.stage1Segments.isNotEmpty()) {
+                    segments = applyThresholdToSegments(cp.stage1Segments, scoreThreshold, belowThresholdSpeed, deleteLowScore)
+                    if (cp.styleInstruction.isNotEmpty()) selectedStylePreset = cp.styleInstruction
+                    if (cp.customPrompt.isNotEmpty()) customPrompt = cp.customPrompt
+                }
+            }
+        }
+    }
+
+    val chunkWindow = 90.0
+    val totalChunks = if (videoMeta != null && videoMeta!!.durationSec > 0) {
+        Math.max(1, Math.ceil(videoMeta!!.durationSec / chunkWindow).toInt())
+    } else 1
+
+    val checkpoint = remember(service, videoMeta, processStatus) {
+        if (service != null && videoMeta != null) {
+            service.getCheckpoint(videoMeta!!.uri.toString())
+        } else null
+    }
+
+    val savedAnalysisResult = remember(service, videoMeta, processStatus) {
+        if (service != null && videoMeta != null) {
+            service.getAnalysisResult(videoMeta!!.uri.toString())
+        } else null
+    }
+
+    val hasCompletedResult = remember(savedAnalysisResult, segments) {
+        (savedAnalysisResult != null && savedAnalysisResult.segments.isNotEmpty()) ||
+                (segments.size > 1 && !(processStatus is ProcessStatus.Analyzing))
+    }
+
+    val maxAnalyzedTime = remember(segments) {
+        if (segments.size > 1) segments.maxOfOrNull { it.endTime } ?: 0.0 else 0.0
+    }
+
+    val hasUnfinishedCheckpoint = remember(checkpoint, segments, videoMeta, maxAnalyzedTime, hasCompletedResult) {
+        if (videoMeta == null || hasCompletedResult) false
+        else if (checkpoint != null && checkpoint.completedChunks > 0 && checkpoint.completedChunks < checkpoint.totalChunks) true
+        else (segments.size > 1 && maxAnalyzedTime < videoMeta!!.durationSec - 10.0)
+    }
+
+    val completedChunkCount = remember(checkpoint, segments, maxAnalyzedTime) {
+        when {
+            checkpoint != null -> checkpoint.completedChunks
+            segments.size > 1 -> (maxAnalyzedTime / chunkWindow).toInt().coerceAtMost(totalChunks)
+            else -> 0
+        }
+    }
+
+    fun persistSegmentsIfCompleted(newSegments: List<Segment>) {
+        segments = newSegments
+        if (service != null && videoMeta != null && newSegments.size > 1) {
+            service.saveAnalysisResult(
+                AnalysisResult(
+                    videoUri = videoMeta!!.uri.toString(),
+                    totalDuration = videoMeta!!.durationSec,
+                    segments = newSegments,
+                    styleInstruction = selectedStylePreset,
+                    customPrompt = customPrompt
+                )
+            )
+        }
+    }
+
+    // 动态阈值变更时，毫秒级纯本地重划分段动作与测算，并自动同步落盘保护
     fun onThresholdChanged(newThresh: Float) {
         scoreThreshold = newThresh
-        segments = applyThresholdToSegments(segments, newThresh, belowThresholdSpeed, deleteLowScore)
+        val updated = applyThresholdToSegments(segments, newThresh, belowThresholdSpeed, deleteLowScore)
+        persistSegmentsIfCompleted(updated)
     }
 
     fun onSpeedChanged(newSpd: Float) {
         belowThresholdSpeed = newSpd
-        segments = applyThresholdToSegments(segments, scoreThreshold, newSpd, deleteLowScore)
+        val updated = applyThresholdToSegments(segments, scoreThreshold, newSpd, deleteLowScore)
+        persistSegmentsIfCompleted(updated)
     }
 
     fun onDeleteLowChanged(deleteLow: Boolean) {
         deleteLowScore = deleteLow
-        segments = applyThresholdToSegments(segments, scoreThreshold, belowThresholdSpeed, deleteLow)
+        val updated = applyThresholdToSegments(segments, scoreThreshold, belowThresholdSpeed, deleteLow)
+        persistSegmentsIfCompleted(updated)
     }
 
     Scaffold(
@@ -354,45 +455,230 @@ fun MainScreen(
 
                             Spacer(modifier = Modifier.height(12.dp))
 
-                            // 开始分析按钮
+                            // 开始/断点继续/取消分析控制区
                             val isAnalyzing = processStatus is ProcessStatus.Analyzing
-                            Button(
-                                onClick = {
-                                    try {
-                                        service?.startAnalysis(
-                                            videoUri = videoMeta!!.uri,
-                                            settings = settings,
-                                            styleInstruction = selectedStylePreset,
-                                            customPrompt = customPrompt
-                                        )
-                                    } catch (e: Throwable) {
-                                        e.printStackTrace()
-                                        Toast.makeText(context, "启动分析失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                            if (isAnalyzing) {
+                                Button(
+                                    onClick = { service?.cancelAnalysis(segments) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(42.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Rose600)
+                                ) {
+                                    Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("取消 Gemini 研读分析", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            } else if (hasCompletedResult) {
+                                // 粗剪研读与打分已完成并落地保护
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = Emerald950.copy(alpha = 0.5f)),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Emerald800),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Emerald400, modifier = Modifier.size(20.dp))
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "AI 粗剪成果已永久落地保护",
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Emerald300
+                                            )
+                                            Text(
+                                                text = "共 ${segments.size} 个剪辑分段 · 1-10分价值曲线就绪，可直接调整或导出",
+                                                fontSize = 10.sp,
+                                                color = Slate300
+                                            )
+                                        }
                                     }
-                                },
-                                enabled = !isAnalyzing,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(42.dp),
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Sky500)
-                            ) {
-                                if (isAnalyzing) {
-                                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("大模型研读分析中...", fontSize = 12.sp)
-                                } else {
+                                }
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                var showReanalyzeConfirmDialog by remember { mutableStateOf(false) }
+
+                                if (showReanalyzeConfirmDialog) {
+                                    AlertDialog(
+                                        onDismissRequest = { showReanalyzeConfirmDialog = false },
+                                        title = { Text("确认重新完整研读？", color = Color.White) },
+                                        text = { Text("当前已永久保存该视频的 ${segments.size} 个粗剪分段成果。重新研读将覆盖已有分析，需耗费较长时间调用大模型。", color = Slate300, fontSize = 12.sp) },
+                                        confirmButton = {
+                                            TextButton(
+                                                onClick = {
+                                                    showReanalyzeConfirmDialog = false
+                                                    service?.clearAnalysisResult(videoMeta!!.uri.toString())
+                                                    service?.clearCheckpoint(videoMeta!!.uri.toString())
+                                                    try {
+                                                        val serviceIntent = Intent(context, VideoProcessingService::class.java)
+                                                        ContextCompat.startForegroundService(context, serviceIntent)
+                                                        service?.startAnalysis(
+                                                            videoUri = videoMeta!!.uri,
+                                                            settings = settings,
+                                                            styleInstruction = selectedStylePreset,
+                                                            customPrompt = customPrompt,
+                                                            resume = false
+                                                        )
+                                                    } catch (e: Throwable) {
+                                                        e.printStackTrace()
+                                                        Toast.makeText(context, "启动分析失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                                }
+                                            ) {
+                                                Text("确认重新研读", color = Rose400, fontWeight = FontWeight.Bold)
+                                            }
+                                        },
+                                        dismissButton = {
+                                            TextButton(onClick = { showReanalyzeConfirmDialog = false }) {
+                                                Text("取消", color = Sky400)
+                                            }
+                                        },
+                                        containerColor = Slate900
+                                    )
+                                }
+
+                                OutlinedButton(
+                                    onClick = { showReanalyzeConfirmDialog = true },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(34.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Slate400)
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("重新完整研读 (将覆盖已有成果)", fontSize = 11.sp)
+                                }
+                            } else if (hasUnfinishedCheckpoint) {
+                                // 存在未完成的断点
+                                val m = (maxAnalyzedTime / 60).toInt()
+                                val s = (maxAnalyzedTime % 60).toInt()
+                                val timeStr = String.format("%02d:%02d", m, s)
+
+                                Button(
+                                    onClick = {
+                                        try {
+                                            val serviceIntent = Intent(context, VideoProcessingService::class.java)
+                                            ContextCompat.startForegroundService(context, serviceIntent)
+                                            service?.startAnalysis(
+                                                videoUri = videoMeta!!.uri,
+                                                settings = settings,
+                                                styleInstruction = selectedStylePreset,
+                                                customPrompt = customPrompt,
+                                                resume = true,
+                                                existingSegments = segments
+                                            )
+                                        } catch (e: Throwable) {
+                                            e.printStackTrace()
+                                            Toast.makeText(context, "启动断点续剪失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(42.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Sky500)
+                                ) {
+                                    Icon(Icons.Default.PlayCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        "从断点继续研读 (第 ${completedChunkCount + 1}/$totalChunks 段 · 已研读至 $timeStr)",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                OutlinedButton(
+                                    onClick = {
+                                        service?.clearCheckpoint(videoMeta!!.uri.toString())
+                                        val initialSeg = Segment(
+                                            startTime = 0.0,
+                                            endTime = videoMeta!!.durationSec,
+                                            duration = videoMeta!!.durationSec,
+                                            action = "keep",
+                                            speed = 1.0f,
+                                            score = 6.0f,
+                                            reason = "原始未剪辑完整视频",
+                                            summary = "完整素材"
+                                        )
+                                        segments = listOf(initialSeg)
+                                        Toast.makeText(context, "已清除断点，恢复初始状态", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(34.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Slate300)
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp), tint = Slate400)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("清除断点，重新从头研读", fontSize = 11.sp)
+                                }
+                            } else {
+                                Button(
+                                    onClick = {
+                                        try {
+                                            val serviceIntent = Intent(context, VideoProcessingService::class.java)
+                                            ContextCompat.startForegroundService(context, serviceIntent)
+                                            service?.startAnalysis(
+                                                videoUri = videoMeta!!.uri,
+                                                settings = settings,
+                                                styleInstruction = selectedStylePreset,
+                                                customPrompt = customPrompt,
+                                                resume = false
+                                            )
+                                        } catch (e: Throwable) {
+                                            e.printStackTrace()
+                                            Toast.makeText(context, "启动分析失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(42.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Sky500)
+                                ) {
                                     Icon(Icons.Default.PlayCircle, contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text("开始 Gemini 智能粗剪 (两阶段研读)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                 }
                             }
 
-                            // 实时分析进度提示
+                            // 实时分析进度提示与快速取消入口
                             if (processStatus is ProcessStatus.Analyzing) {
                                 val st = processStatus as ProcessStatus.Analyzing
                                 Spacer(modifier = Modifier.height(10.dp))
                                 Column {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "${st.message} (${st.progress.toInt()}%)",
+                                            fontSize = 10.sp,
+                                            color = Sky300,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(
+                                            onClick = { service?.cancelAnalysis(segments) },
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(24.dp)
+                                        ) {
+                                            Text("终止", fontSize = 10.sp, color = Rose400)
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
                                     LinearProgressIndicator(
                                         progress = { st.progress / 100f },
                                         color = Sky400,
@@ -402,12 +688,63 @@ fun MainScreen(
                                             .height(4.dp)
                                             .clip(RoundedCornerShape(2.dp))
                                     )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = "${st.message} (${st.progress.toInt()}%)",
-                                        fontSize = 10.sp,
-                                        color = Sky300
-                                    )
+                                }
+                            }
+
+                            // 分析错误卡片反馈与断点一键重试
+                            if (processStatus is ProcessStatus.Error && !(processStatus as ProcessStatus.Error).message.contains("导出")) {
+                                val err = processStatus as ProcessStatus.Error
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = Rose950.copy(alpha = 0.5f)),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Rose800),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = Rose400, modifier = Modifier.size(18.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(err.message, fontSize = 11.sp, color = Rose200, modifier = Modifier.weight(1f))
+                                            TextButton(onClick = { isSettingsOpen = true }) {
+                                                Text("查验设置", fontSize = 10.sp, color = Sky300)
+                                            }
+                                        }
+                                        if (hasUnfinishedCheckpoint) {
+                                            Spacer(modifier = Modifier.height(6.dp))
+                                            Button(
+                                                onClick = {
+                                                    try {
+                                                        val serviceIntent = Intent(context, VideoProcessingService::class.java)
+                                                        ContextCompat.startForegroundService(context, serviceIntent)
+                                                        service?.startAnalysis(
+                                                            videoUri = videoMeta!!.uri,
+                                                            settings = settings,
+                                                            styleInstruction = selectedStylePreset,
+                                                            customPrompt = customPrompt,
+                                                            resume = true,
+                                                            existingSegments = segments
+                                                        )
+                                                    } catch (e: Throwable) {
+                                                        e.printStackTrace()
+                                                        Toast.makeText(context, "重试失败: ${e.localizedMessage ?: e.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Rose600),
+                                                shape = RoundedCornerShape(6.dp),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(32.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                            ) {
+                                                Icon(Icons.Default.Replay, contentDescription = null, modifier = Modifier.size(14.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("从断点重试继续", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -421,6 +758,7 @@ fun MainScreen(
                         totalDurationSec = videoMeta!!.durationSec,
                         segments = segments,
                         onCurrentTimeUpdate = { currentPlayheadSec = it },
+                        playerSeekController = playerSeekController,
                         onSplitCurrentTime = { cutTime ->
                             val targetIdx = segments.findIndexForSplit(cutTime)
                             if (targetIdx != -1) {
@@ -431,7 +769,7 @@ fun MainScreen(
                                 m.removeAt(targetIdx)
                                 m.add(targetIdx, sA)
                                 m.add(targetIdx + 1, sB)
-                                segments = m
+                                persistSegmentsIfCompleted(m)
                                 Toast.makeText(context, "已在当前帧裁切分段", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -460,7 +798,7 @@ fun MainScreen(
                             segments = segments,
                             scoreThreshold = scoreThreshold,
                             currentPlayheadSec = currentPlayheadSec,
-                            onSeekToTime = { /* seek player */ }
+                            onSeekToTime = { playerSeekController.seekTo(it) }
                         )
                     }
 
@@ -471,7 +809,7 @@ fun MainScreen(
                             onUpdateSegmentAction = { index, act, spd ->
                                 val m = segments.toMutableList()
                                 m[index] = m[index].copy(action = act, speed = spd)
-                                segments = m
+                                persistSegmentsIfCompleted(m)
                             },
                             onMergeWithNext = { index ->
                                 if (index < segments.size - 1) {
@@ -487,7 +825,22 @@ fun MainScreen(
                                     m.removeAt(index)
                                     m.removeAt(index)
                                     m.add(index, merged)
-                                    segments = m
+                                    persistSegmentsIfCompleted(m)
+                                }
+                            },
+                            onSeekToTime = { playerSeekController.seekTo(it) },
+                            onAdjustBoundary = { index, nStart, nEnd ->
+                                if (index in segments.indices) {
+                                    val cur = segments[index]
+                                    val dur = Math.round((nEnd - nStart) * 100.0) / 100.0
+                                    val updated = cur.copy(
+                                        startTime = nStart,
+                                        endTime = nEnd,
+                                        duration = Math.max(0.1, dur)
+                                    )
+                                    val m = segments.toMutableList()
+                                    m[index] = updated
+                                    persistSegmentsIfCompleted(m)
                                 }
                             }
                         )
@@ -495,21 +848,40 @@ fun MainScreen(
 
                     // 7. 导出按钮
                     item {
+                        val isExporting = processStatus is ProcessStatus.Exporting
                         Button(
                             onClick = { isExportSheetOpen = true },
+                            enabled = !isExporting,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(46.dp),
                             shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Emerald500)
-                        ) {
-                            Icon(Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "配置并导出成片 (Media3 硬件加速)",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isExporting) Slate800 else Emerald500
                             )
+                        ) {
+                            if (isExporting) {
+                                CircularProgressIndicator(
+                                    color = Sky400,
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "成片硬件合成中... (${(processStatus as ProcessStatus.Exporting).progress.toInt()}%)",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Sky300
+                                )
+                            } else {
+                                Icon(Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "配置并导出成片 (Media3 硬件加速)",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
                 }
@@ -522,6 +894,7 @@ fun MainScreen(
         isOpen = isExportSheetOpen,
         onDismiss = { isExportSheetOpen = false },
         estimatedOutputSec = segments.sumOf { it.effectiveDuration },
+        isPortrait = (videoMeta?.width ?: 0) < (videoMeta?.height ?: 0),
         onConfirmExport = { targetW, targetH, muteFf ->
             videoMeta?.let { meta ->
                 service?.startExport(
@@ -531,6 +904,28 @@ fun MainScreen(
                     targetHeight = targetH,
                     muteFastForwardAudio = muteFf
                 )
+            }
+        }
+    )
+
+    // 方案 A：模态导出进度与完成看板浮层
+    ExportProgressDialog(
+        status = processStatus,
+        onCancel = {
+            service?.cancelExport(segments)
+        },
+        onDismiss = {
+            service?.resetStatus(segments)
+        },
+        onPlayVideo = { uri ->
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/mp4")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                Toast.makeText(context, "无法调用系统播放器: ${e.localizedMessage ?: e.message}", Toast.LENGTH_SHORT).show()
             }
         }
     )

@@ -34,6 +34,18 @@ import com.smartvideo.app.data.model.Segment
 import com.smartvideo.app.ui.theme.*
 import kotlinx.coroutines.delay
 
+class PlayerSeekController {
+    private var seekHandler: ((Double) -> Unit)? = null
+
+    fun setHandler(handler: ((Double) -> Unit)?) {
+        seekHandler = handler
+    }
+
+    fun seekTo(timeSec: Double) {
+        seekHandler?.invoke(timeSec)
+    }
+}
+
 @OptIn(UnstableApi::class)
 @Composable
 fun ExoPlayerPreview(
@@ -42,6 +54,7 @@ fun ExoPlayerPreview(
     segments: List<Segment>,
     onCurrentTimeUpdate: (Double) -> Unit,
     onSplitCurrentTime: (Double) -> Unit,
+    playerSeekController: PlayerSeekController? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -68,6 +81,18 @@ fun ExoPlayerPreview(
         }
     }
 
+    DisposableEffect(exoPlayer, playerSeekController) {
+        playerSeekController?.setHandler { targetSec ->
+            val clamped = targetSec.coerceIn(0.0, totalDurationSec)
+            exoPlayer.seekTo((clamped * 1000).toLong())
+            currentTimeSec = clamped
+            onCurrentTimeUpdate(clamped)
+        }
+        onDispose {
+            playerSeekController?.setHandler(null)
+        }
+    }
+
     // 播放监听与模拟成片联动 (快进变频与跳删)
     LaunchedEffect(isPlaying, simulatePreview, segments) {
         while (true) {
@@ -82,7 +107,12 @@ fun ExoPlayerPreview(
                         when (currentSeg.action) {
                             "delete" -> {
                                 val targetSec = Math.min(currentSeg.endTime + 0.05, totalDurationSec)
-                                exoPlayer.seekTo((targetSec * 1000).toLong())
+                                if (targetSec >= totalDurationSec) {
+                                    exoPlayer.pause()
+                                    exoPlayer.seekTo((totalDurationSec * 1000).toLong())
+                                } else {
+                                    exoPlayer.seekTo((targetSec * 1000).toLong())
+                                }
                             }
                             "fast_forward" -> {
                                 val spd = Math.max(0.5f, Math.min(16.0f, currentSeg.speed))
@@ -90,12 +120,18 @@ fun ExoPlayerPreview(
                                     exoPlayer.setPlaybackSpeed(spd)
                                     activeSpeed = spd
                                 }
+                                if (spd >= 4.0f) {
+                                    if (exoPlayer.volume != 0f) exoPlayer.volume = 0f
+                                } else {
+                                    if (exoPlayer.volume != 1f) exoPlayer.volume = 1f
+                                }
                             }
                             else -> {
                                 if (exoPlayer.playbackParameters.speed != 1.0f) {
                                     exoPlayer.setPlaybackSpeed(1.0f)
                                     activeSpeed = 1.0f
                                 }
+                                if (exoPlayer.volume != 1f) exoPlayer.volume = 1f
                             }
                         }
                     }
@@ -104,6 +140,7 @@ fun ExoPlayerPreview(
                         exoPlayer.setPlaybackSpeed(1.0f)
                         activeSpeed = 1.0f
                     }
+                    if (exoPlayer.volume != 1f) exoPlayer.volume = 1f
                 }
             }
             delay(100)

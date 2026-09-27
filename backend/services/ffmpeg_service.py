@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import uuid
 import shutil
 import asyncio
 import subprocess
@@ -291,7 +292,7 @@ class FFmpegService:
         Fast slice & downsample a specific time chunk [start_time, end_time] into a lightweight proxy MP4 (~2-4 MB).
         """
         ffmpeg_bin = self.get_ffmpeg_path()
-        chunk_path = str(TEMP_DIR / f"chunk_{chunk_index}_{Path(input_file).stem}.mp4")
+        chunk_path = str(TEMP_DIR / f"chunk_{chunk_index}_{uuid.uuid4().hex[:6]}_{Path(input_file).stem}.mp4")
 
         # Fast seeking with -ss before -i, and -to for exact slice
         cmd = [

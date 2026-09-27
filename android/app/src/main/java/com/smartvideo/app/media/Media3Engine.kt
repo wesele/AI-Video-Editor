@@ -10,9 +10,12 @@ import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
+import androidx.media3.effect.SpeedChangeEffect
 import androidx.media3.transformer.*
 import com.smartvideo.app.data.model.Segment
 import kotlinx.coroutines.CompletableDeferred
@@ -27,6 +30,16 @@ import java.io.FileOutputStream
 class Media3Engine(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var activeExportTransformer: Transformer? = null
+
+    fun cancelExport() {
+        mainHandler.post {
+            try {
+                activeExportTransformer?.cancel()
+                activeExportTransformer = null
+            } catch (_: Throwable) {}
+        }
+    }
 
     /**
      * 生成供 Gemini 视觉理解分析用的超轻量分段代理视频（360p 低码率 MP4）
@@ -149,9 +162,35 @@ class Media3Engine(private val context: Context) {
                         .setClippingConfiguration(clippingConfig)
                         .build()
 
-                    val shouldMute = seg.isFastForward && muteFastForwardAudio
+                    val speed = if (seg.isFastForward && seg.speed > 0f) seg.speed else 1.0f
+                    val shouldMute = seg.isFastForward && (muteFastForwardAudio || speed >= 4.0f)
+
+                    val videoEffects = mutableListOf<Effect>()
+                    if (targetWidth > 0 && targetHeight > 0) {
+                        videoEffects.add(
+                            Presentation.createForWidthAndHeight(
+                                targetWidth,
+                                targetHeight,
+                                Presentation.LAYOUT_SCALE_TO_FIT
+                            )
+                        )
+                    }
+                    if (seg.isFastForward && speed != 1.0f) {
+                        videoEffects.add(SpeedChangeEffect(speed))
+                    }
+
+                    val audioProcessors = mutableListOf<AudioProcessor>()
+                    if (seg.isFastForward && !shouldMute && speed != 1.0f) {
+                        val sonic = SonicAudioProcessor().apply {
+                            setSpeed(speed)
+                        }
+                        audioProcessors.add(sonic)
+                    }
+
+                    val effects = Effects(audioProcessors, videoEffects)
 
                     val item = EditedMediaItem.Builder(mediaItem)
+                        .setEffects(effects)
                         .setRemoveAudio(shouldMute)
                         .build()
 
@@ -159,11 +198,13 @@ class Media3Engine(private val context: Context) {
                 }
 
                 val sequence = EditedMediaItemSequence(editedMediaItemList)
-                val composition = Composition.Builder(listOf(sequence)).build()
+                val composition = Composition.Builder(listOf(sequence))
+                    .experimentalSetForceAudioTrack(true)
+                    .build()
 
-                var transformerRef: Transformer? = null
                 val listener = object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        activeExportTransformer = null
                         deferred.complete(tempOutput)
                     }
 
@@ -172,6 +213,7 @@ class Media3Engine(private val context: Context) {
                         exportResult: ExportResult,
                         exportException: ExportException
                     ) {
+                        activeExportTransformer = null
                         deferred.completeExceptionally(exportException)
                     }
                 }
@@ -187,19 +229,32 @@ class Media3Engine(private val context: Context) {
                     .addListener(listener)
                     .build()
 
-                transformerRef = transformer
+                activeExportTransformer = transformer
 
                 transformer.start(composition, tempOutput.absolutePath)
             } catch (t: Throwable) {
+                activeExportTransformer = null
                 deferred.completeExceptionally(t)
             }
         }
 
-        // 轮询导出进度
+        // 轮询导出硬件编码进度并回调
         val progressHolder = ProgressHolder()
         while (!deferred.isCompleted) {
-            delay(500)
-            // progress notification callback
+            delay(300)
+            if (deferred.isCompleted) break
+            withContext(Dispatchers.Main) {
+                val t = activeExportTransformer
+                if (t != null && !deferred.isCompleted) {
+                    val state = t.getProgress(progressHolder)
+                    if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                        val p = progressHolder.progress.toFloat()
+                        withContext(Dispatchers.IO) {
+                            onProgress(p)
+                        }
+                    }
+                }
+            }
         }
 
         val completedFile = deferred.await()

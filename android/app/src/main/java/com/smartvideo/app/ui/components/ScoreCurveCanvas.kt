@@ -73,6 +73,16 @@ fun ScoreCurveCanvas(
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {
+                val maxAnalyzedTime = if (segments.size > 1) segments.maxOfOrNull { it.endTime } ?: 0.0 else 0.0
+                val isPartial = segments.size > 1 && (duration - maxAnalyzedTime) > 5.0
+
+                if (isPartial) {
+                    Box(modifier = Modifier.size(7.dp).background(Sky400, RoundedCornerShape(2.dp)))
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text("待续剪", fontSize = 9.sp, color = Sky300)
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+
                 Box(modifier = Modifier.size(8.dp).background(Emerald500, RoundedCornerShape(2.dp)))
                 Spacer(modifier = Modifier.width(3.dp))
                 Text("≥${String.format("%.1f", scoreThreshold)}分 保留", fontSize = 9.sp, color = Slate400)
@@ -221,6 +231,26 @@ fun ScoreCurveCanvas(
                             pathEffect = dashEffect
                         )
                     }
+                }
+
+                // 2.5 绘制未研读区间半透明遮罩与断点虚线
+                val maxAnalyzedTime = if (segments.size > 1) segments.maxOfOrNull { it.endTime } ?: 0.0 else 0.0
+                if (segments.size > 1 && (duration - maxAnalyzedTime) > 5.0) {
+                    val xCut = ((maxAnalyzedTime / duration) * w).toFloat().coerceIn(0f, w)
+                    // 未分析区域半透明深色遮罩
+                    drawRect(
+                        color = Color(0x66020617),
+                        topLeft = Offset(xCut, 0f),
+                        size = androidx.compose.ui.geometry.Size(w - xCut, h)
+                    )
+                    // 断点分界竖线
+                    drawLine(
+                        color = Sky400.copy(alpha = 0.8f),
+                        start = Offset(xCut, 0f),
+                        end = Offset(xCut, h),
+                        strokeWidth = 2f,
+                        pathEffect = dashEffect
+                    )
                 }
 
                 // 3. 绘制动态天蓝色阈值虚线

@@ -81,8 +81,10 @@ class GeminiService:
         custom_prompt: Optional[str] = "",
         default_ff_speed: float = 4.0,
         resume: bool = False,
+        concurrency: int = 4,
         progress_callback: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
+        safe_concurrency = max(1, min(8, int(concurrency)))
         settings = get_settings()
         base_url = settings.get("gemini_base_url", "http://192.168.31.233:8317").rstrip("/")
         api_key = settings.get("gemini_api_key", "").strip()
@@ -120,6 +122,7 @@ class GeminiService:
                 "style_preset": style_preset,
                 "custom_prompt": custom_prompt,
                 "default_fast_forward_speed": default_ff_speed,
+                "concurrency": safe_concurrency,
             }
             self.save_checkpoint(checkpoint)
         else:
@@ -139,6 +142,7 @@ class GeminiService:
                     "style_preset": style_preset,
                     "custom_prompt": custom_prompt,
                     "default_fast_forward_speed": default_ff_speed,
+                    "concurrency": safe_concurrency,
                 },
                 "stage1_completed_chunks": [],
                 "final_segments": None,
@@ -155,51 +159,73 @@ class GeminiService:
             sec = int(s % 60)
             return f"{m:02d}:{sec:02d}"
 
-        for idx, (st, et) in enumerate(chunks):
+        # Stage 1: Chunk factual extraction with concurrency (1-8, default 4)
+        completed_chunks_map: Dict[int, List[Dict[str, Any]]] = {}
+        for c in checkpoint.get("stage1_completed_chunks", []):
+            completed_chunks_map[c["chunk_index"]] = c["segments"]
+
+        completed_count = len(completed_chunks_map)
+        checkpoint_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(safe_concurrency)
+        first_error: Optional[Exception] = None
+
+        def get_current_sorted_segments() -> List[Dict[str, Any]]:
+            res = []
+            for i in sorted(completed_chunks_map.keys()):
+                res.extend(completed_chunks_map[i])
+            return res
+
+        if completed_count > 0 and progress_callback:
+            init_pct = round((completed_count / total_chunks) * 75.0, 1)
+            progress_callback(
+                init_pct,
+                f"[第一步 事实提取] 已复用已保存的前序 {completed_count}/{total_chunks} 段事实...",
+                get_current_sorted_segments(),
+            )
+
+        async def process_single_chunk(idx: int, st: float, et: float):
+            nonlocal first_error, completed_count
+            if first_error is not None:
+                return
+
             chunk_dur = round(et - st, 2)
-            if idx in stage1_completed:
-                norm_chunk = stage1_completed[idx]["segments"]
-                all_segments.extend(norm_chunk)
+            async with sem:
+                if first_error is not None:
+                    return
+
                 if progress_callback:
-                    pct = round(((idx + 1) / total_chunks) * 75.0, 1)
+                    chunk_pct_slice = round((completed_count / total_chunks) * 75.0 + 0.5, 1)
                     progress_callback(
-                        pct,
-                        f"[第一步 事实提取] 已复用已保存的第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)})...",
-                        all_segments,
+                        chunk_pct_slice,
+                        f"[第一步 事实提取] 正在切片与分析第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)}) [并发: {safe_concurrency}]...",
+                        get_current_sorted_segments(),
                     )
-                continue
 
-            if progress_callback:
-                chunk_pct_slice = round((idx / total_chunks) * 75.0 + 1.0, 1)
-                progress_callback(
-                    chunk_pct_slice,
-                    f"正在切片第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)})...",
-                    all_segments,
-                )
+                # Auto-retry up to 3 times
+                last_err = None
+                norm_chunk = None
 
-            # Auto-retry up to 3 times
-            last_err = None
-            norm_chunk = None
+                for attempt in range(1, 4):
+                    if first_error is not None:
+                        return
+                    chunk_path = None
+                    try:
+                        # Step A: Slice chunk to lightweight proxy (typically 2-4 MB)
+                        chunk_path = await ffmpeg_service.slice_chunk_proxy_async(video_path, st, et, idx)
 
-            for attempt in range(1, 4):
-                chunk_path = None
-                try:
-                    # Step A: Slice chunk to lightweight proxy (typically 2-4 MB)
-                    chunk_path = await ffmpeg_service.slice_chunk_proxy_async(video_path, st, et, idx)
+                        # Step B: Base64 encode chunk
+                        with open(chunk_path, "rb") as f:
+                            video_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-                    # Step B: Base64 encode chunk
-                    with open(chunk_path, "rb") as f:
-                        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        if os.path.exists(chunk_path):
+                            try:
+                                os.remove(chunk_path)
+                                chunk_path = None
+                            except Exception:
+                                pass
 
-                    if os.path.exists(chunk_path):
-                        try:
-                            os.remove(chunk_path)
-                            chunk_path = None
-                        except Exception:
-                            pass
-
-                    # Step C: Prompt for chunk factual extraction (Stage 1)
-                    chunk_prompt = f"""你是一名顶级专业视频视听分析师。你正在分析视频的第 {idx+1}/{total_chunks} 分段。
+                        # Step C: Prompt for chunk factual extraction (Stage 1)
+                        chunk_prompt = f"""你是一名顶级专业视频视听分析师。你正在分析视频的第 {idx+1}/{total_chunks} 分段。
 该分段在整片视频中的绝对时间范围是：【从 {st:.1f} 秒 到 {et:.1f} 秒】（本分段总时长 {chunk_dur:.1f} 秒）。
 你的任务是对这一时间区间内的视听事实信息进行全面细致的提取（用于后续全片全局宏观剪辑决策）：
 1. 观察画面场景环境、主体行为、关键动作（scene_desc）；
@@ -223,86 +249,109 @@ class GeminiService:
   - "action": 初步动作建议 ("keep" | "fast_forward" | "delete")
 """
 
-                    payload = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {"text": chunk_prompt},
-                                    {
-                                        "inline_data": {
-                                            "mime_type": "video/mp4",
-                                            "data": video_b64
+                        payload = {
+                            "contents": [
+                                {
+                                    "parts": [
+                                        {"text": chunk_prompt},
+                                        {
+                                            "inline_data": {
+                                                "mime_type": "video/mp4",
+                                                "data": video_b64
+                                            }
                                         }
-                                    }
-                                ]
+                                    ]
+                                }
+                            ],
+                            "generationConfig": {
+                                "response_mime_type": "application/json"
                             }
-                        ],
-                        "generationConfig": {
-                            "response_mime_type": "application/json"
                         }
-                    }
+
+                        if progress_callback:
+                            chunk_pct_ai = round((completed_count / total_chunks) * 75.0 + 1.0, 1)
+                            retry_suffix = f" (第{attempt}次重试)..." if attempt > 1 else "..."
+                            progress_callback(
+                                chunk_pct_ai,
+                                f"[第一步 事实提取] {pure_model} 正在分析第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)}){retry_suffix}",
+                                get_current_sorted_segments(),
+                            )
+
+                        async with httpx.AsyncClient(timeout=120.0) as client:
+                            resp = await client.post(endpoint, json=payload)
+                            if resp.status_code != 200:
+                                raise RuntimeError(f"Gemini API 响应异常 (HTTP {resp.status_code}): {resp.text[:200]}")
+                            res_json = resp.json()
+                            if "candidates" not in res_json or not res_json["candidates"]:
+                                raise RuntimeError("Gemini 返回候选内容为空")
+                            candidate = res_json["candidates"][0]
+                            if "content" not in candidate or "parts" not in candidate["content"]:
+                                raise RuntimeError("Gemini 返回数据结构异常")
+                            raw_text = candidate["content"]["parts"][0]["text"]
+                            raw_segments = self._parse_json_segments(raw_text)
+
+                        norm_chunk = self._normalize_chunk_timeline(raw_segments, st, et, default_ff_speed)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"分段 {idx+1}/{total_chunks} 第 {attempt} 次提取异常: {e}")
+                        if chunk_path and os.path.exists(chunk_path):
+                            try:
+                                os.remove(chunk_path)
+                            except Exception:
+                                pass
+                        if attempt < 3:
+                            await asyncio.sleep(attempt * 1.5)
+
+                if last_err is not None:
+                    async with checkpoint_lock:
+                        if first_error is None:
+                            first_error = RuntimeError(f"第 {idx+1}/{total_chunks} 段 ({fmt_time(st)}~{fmt_time(et)}) 事实提取失败: {str(last_err)}")
+                            checkpoint["status"] = "failed"
+                            checkpoint["failed_stage"] = "stage1"
+                            checkpoint["failed_chunk_index"] = idx
+                            checkpoint["error_message"] = str(last_err)
+                            self.save_checkpoint(checkpoint)
+                    raise first_error
+
+                async with checkpoint_lock:
+                    completed_chunks_map[idx] = norm_chunk
+                    completed_count += 1
+                    checkpoint["stage1_completed_chunks"] = [
+                        {
+                            "chunk_index": i,
+                            "st": chunks[i][0],
+                            "et": chunks[i][1],
+                            "segments": completed_chunks_map[i],
+                        }
+                        for i in sorted(completed_chunks_map.keys())
+                    ]
+                    checkpoint["status"] = "processing"
+                    self.save_checkpoint(checkpoint)
 
                     if progress_callback:
-                        chunk_pct_ai = round((idx / total_chunks) * 75.0 + (0.8 / total_chunks) * 75.0, 1)
-                        retry_suffix = f" (第{attempt}次重试)..." if attempt > 1 else "..."
+                        chunk_pct_done = round((completed_count / total_chunks) * 75.0, 1)
+                        sorted_segs = get_current_sorted_segments()
                         progress_callback(
-                            chunk_pct_ai,
-                            f"[第一步 事实提取] {pure_model} 正在分析第 {idx+1}/{total_chunks} 段 ({fmt_time(st)} ~ {fmt_time(et)}){retry_suffix}",
-                            all_segments,
+                            chunk_pct_done,
+                            f"[第一步 事实提取] 已完成 {completed_count}/{total_chunks} 段！已提取 {len(sorted_segs)} 个事实事件 (并发: {safe_concurrency})",
+                            sorted_segs,
                         )
 
-                    async with httpx.AsyncClient(timeout=120.0) as client:
-                        resp = await client.post(endpoint, json=payload)
-                        if resp.status_code != 200:
-                            raise RuntimeError(f"Gemini API 响应异常 (HTTP {resp.status_code}): {resp.text[:200]}")
-                        res_json = resp.json()
-                        if "candidates" not in res_json or not res_json["candidates"]:
-                            raise RuntimeError("Gemini 返回候选内容为空")
-                        candidate = res_json["candidates"][0]
-                        if "content" not in candidate or "parts" not in candidate["content"]:
-                            raise RuntimeError("Gemini 返回数据结构异常")
-                        raw_text = candidate["content"]["parts"][0]["text"]
-                        raw_segments = self._parse_json_segments(raw_text)
+        # Launch concurrent tasks for remaining chunks
+        pending_chunks = [
+            (idx, st, et) for idx, (st, et) in enumerate(chunks) if idx not in completed_chunks_map
+        ]
 
-                    norm_chunk = self._normalize_chunk_timeline(raw_segments, st, et, default_ff_speed)
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    print(f"分段 {idx+1}/{total_chunks} 第 {attempt} 次提取异常: {e}")
-                    if chunk_path and os.path.exists(chunk_path):
-                        try:
-                            os.remove(chunk_path)
-                        except Exception:
-                            pass
-                    if attempt < 3:
-                        await asyncio.sleep(attempt * 1.5)
+        if pending_chunks:
+            tasks = [process_single_chunk(idx, st, et) for (idx, st, et) in pending_chunks]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    raise r
 
-            if last_err is not None:
-                checkpoint["status"] = "failed"
-                checkpoint["failed_stage"] = "stage1"
-                checkpoint["failed_chunk_index"] = idx
-                checkpoint["error_message"] = str(last_err)
-                self.save_checkpoint(checkpoint)
-                raise RuntimeError(f"第 {idx+1}/{total_chunks} 段 ({fmt_time(st)}~{fmt_time(et)}) 事实提取失败: {str(last_err)}")
-
-            all_segments.extend(norm_chunk)
-            checkpoint["stage1_completed_chunks"].append({
-                "chunk_index": idx,
-                "st": st,
-                "et": et,
-                "segments": norm_chunk,
-            })
-            checkpoint["status"] = "processing"
-            self.save_checkpoint(checkpoint)
-
-            if progress_callback:
-                chunk_pct_done = round(((idx + 1) / total_chunks) * 75.0, 1)
-                progress_callback(
-                    chunk_pct_done,
-                    f"[第一步 事实提取] 第 {idx+1}/{total_chunks} 段完成！已提取 {len(all_segments)} 个事实事件",
-                    all_segments,
-                )
+        all_segments = get_current_sorted_segments()
 
         # =========================================================================
         # Stage 2: Global Macro Analysis & 1-10 Value Curve Evaluation

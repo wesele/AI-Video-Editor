@@ -24,6 +24,7 @@ fun ExportBottomSheet(
     isOpen: Boolean,
     onDismiss: () -> Unit,
     estimatedOutputSec: Double,
+    isPortrait: Boolean = false,
     onConfirmExport: (targetWidth: Int, targetHeight: Int, muteFfAudio: Boolean) -> Unit
 ) {
     if (!isOpen) return
@@ -32,6 +33,20 @@ fun ExportBottomSheet(
     var muteFfAudio by remember { mutableStateOf(false) }
 
     val modalBottomSheetState = rememberModalBottomSheetState()
+
+    val resOptions = if (isPortrait) {
+        listOf(
+            "原画" to "原始",
+            "1080p" to "1080x1920",
+            "720p" to "720x1280"
+        )
+    } else {
+        listOf(
+            "原画" to "原始",
+            "1080p" to "1920x1080",
+            "720p" to "1280x720"
+        )
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -91,10 +106,21 @@ fun ExportBottomSheet(
             Spacer(modifier = Modifier.height(16.dp))
 
             // 分辨率选择
-            Text(text = "输出分辨率:", fontSize = 12.sp, color = Slate300, fontWeight = FontWeight.Medium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "输出分辨率:", fontSize = 12.sp, color = Slate300, fontWeight = FontWeight.Medium)
+                Text(
+                    text = if (isPortrait) "当前素材为竖屏拍摄 (9:16)" else "当前素材为横屏拍摄 (16:9)",
+                    fontSize = 10.sp,
+                    color = Sky400
+                )
+            }
             Spacer(modifier = Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("原画" to (0 to 0), "1080p" to (1920 to 1080), "720p" to (1280 to 720)).forEach { (label, _) ->
+                resOptions.forEach { (label, dimDesc) ->
                     val isSelected = selectedResolution == label
                     Box(
                         modifier = Modifier
@@ -105,12 +131,19 @@ fun ExportBottomSheet(
                             .padding(vertical = 8.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = label,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isSelected) Color.White else Slate300
-                        )
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = label,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) Color.White else Slate300
+                            )
+                            Text(
+                                text = dimDesc,
+                                fontSize = 9.sp,
+                                color = if (isSelected) Color.White.copy(alpha = 0.8f) else Slate400
+                            )
+                        }
                     }
                 }
             }
@@ -130,7 +163,7 @@ fun ExportBottomSheet(
             ) {
                 Column {
                     Text(text = "快进段音频静音", fontSize = 12.sp, color = Color.White)
-                    Text(text = "高倍速快进时消除变频杂音", fontSize = 10.sp, color = Slate400)
+                    Text(text = "高倍速(≥4x)自动静音降噪，可在此强制全部快进静音", fontSize = 10.sp, color = Slate400)
                 }
                 Switch(
                     checked = muteFfAudio,
@@ -149,8 +182,9 @@ fun ExportBottomSheet(
             Button(
                 onClick = {
                     val (w, h) = when (selectedResolution) {
-                        "720p" -> 1280 to 720
-                        else -> 1920 to 1080
+                        "原画" -> 0 to 0
+                        "720p" -> if (isPortrait) 720 to 1280 else 1280 to 720
+                        else -> if (isPortrait) 1080 to 1920 else 1920 to 1080
                     }
                     onConfirmExport(w, h, muteFfAudio)
                     onDismiss()

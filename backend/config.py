@@ -25,6 +25,7 @@ if ENV_FILE.exists():
 DEFAULT_GEMINI_BASE_URL = "http://192.168.31.233:8317"
 DEFAULT_GEMINI_API_KEY = "sk-X3FATzGIIlF5Q7HQx"
 DEFAULT_MODEL = "gemini-3.8-flash-high"
+DEFAULT_CONCURRENCY = 4
 
 AVAILABLE_MODELS = [
     {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (推荐)", "desc": "高性能且速度极快，多模态综合能力最优"},
@@ -38,10 +39,17 @@ AVAILABLE_MODELS = [
 ]
 
 def get_settings():
+    try:
+        raw_concurrency = int(os.getenv("DEFAULT_CONCURRENCY", str(DEFAULT_CONCURRENCY)))
+        concurrency = max(1, min(8, raw_concurrency))
+    except (ValueError, TypeError):
+        concurrency = DEFAULT_CONCURRENCY
+
     return {
         "gemini_base_url": os.getenv("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE_URL),
         "gemini_api_key": os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY),
         "default_model": os.getenv("DEFAULT_MODEL", DEFAULT_MODEL),
+        "default_concurrency": concurrency,
         "custom_ffmpeg_path": os.getenv("CUSTOM_FFMPEG_PATH", ""),
     }
 
@@ -51,10 +59,18 @@ def update_settings(new_settings: dict):
         with open(ENV_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
     
+    concurrency_val = new_settings.get("default_concurrency")
+    if concurrency_val is not None:
+        try:
+            concurrency_val = max(1, min(8, int(concurrency_val)))
+        except (ValueError, TypeError):
+            concurrency_val = DEFAULT_CONCURRENCY
+
     config_map = {
         "GEMINI_BASE_URL": new_settings.get("gemini_base_url"),
         "GEMINI_API_KEY": new_settings.get("gemini_api_key"),
         "DEFAULT_MODEL": new_settings.get("default_model"),
+        "DEFAULT_CONCURRENCY": concurrency_val,
         "CUSTOM_FFMPEG_PATH": new_settings.get("custom_ffmpeg_path"),
     }
     

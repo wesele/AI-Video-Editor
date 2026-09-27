@@ -42,6 +42,9 @@ data/exports/*
 !data/exports/.gitkeep
 data/temp/*
 !data/temp/.gitkeep
+data/checkpoints/*
+!data/checkpoints/.gitkeep
+data/*.png
 temp/
 *.mp4
 *.mov

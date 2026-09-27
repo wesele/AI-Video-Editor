@@ -10,10 +10,21 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import threading
+from backend.main import app
 from backend.config import TEMP_DIR
+
+def start_server():
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8999, log_level="warning")
 
 async def test_chunk_pipeline():
     print("=== 测试分段流水线切片并发分析 ===")
+
+    # Start server in thread
+    t = threading.Thread(target=start_server, daemon=True)
+    t.start()
+    await asyncio.sleep(1.5)
 
     # Generate a 12-second test video with duration simulated
     sample_video = TEMP_DIR / "test_pipe_clip.mp4"
@@ -27,7 +38,7 @@ async def test_chunk_pipeline():
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"[1] 生成测试视频: {sample_video}")
 
-    base_url = "http://127.0.0.1:8088"
+    base_url = "http://127.0.0.1:8999"
     async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
         # Upload
         print("[2] 上传视频...")

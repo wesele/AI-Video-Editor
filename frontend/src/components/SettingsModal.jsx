@@ -6,6 +6,7 @@ export default function SettingsModal({ isOpen, onClose, systemStatus, onSetting
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('gemini-3.8-flash-high');
+  const [concurrency, setConcurrency] = useState(4);
   const [ffmpegPath, setFfmpegPath] = useState('');
   const [loading, setLoading] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -18,6 +19,7 @@ export default function SettingsModal({ isOpen, onClose, systemStatus, onSetting
         setBaseUrl(d.gemini_base_url || 'http://192.168.31.233:8317');
         setApiKey(d.gemini_api_key || 'sk-X3FATzGIIlF5Q7HQx');
         setModel(d.default_model || 'gemini-3.8-flash-high');
+        setConcurrency(d.default_concurrency || 4);
         setFfmpegPath(d.custom_ffmpeg_path || '');
         setSaveSuccess(false);
         setErrorMsg('');
@@ -44,6 +46,7 @@ export default function SettingsModal({ isOpen, onClose, systemStatus, onSetting
         gemini_base_url: baseUrl.trim(),
         gemini_api_key: apiKey.trim(),
         default_model: model,
+        default_concurrency: Number(concurrency) || 4,
         custom_ffmpeg_path: ffmpegPath.trim(),
       });
       setSaveSuccess(true);
@@ -131,6 +134,27 @@ export default function SettingsModal({ isOpen, onClose, systemStatus, onSetting
                 </option>
               ))}
             </select>
+          </div>
+
+          {/* Default Concurrency Threads */}
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1.5 flex items-center justify-between">
+              <span>默认粗剪并发线程数 (1-8 线程)</span>
+              <span className="text-emerald-400 font-mono font-bold">{concurrency} 线程</span>
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min="1"
+                max="8"
+                step="1"
+                value={concurrency}
+                onChange={e => setConcurrency(parseInt(e.target.value, 10))}
+                className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+              />
+              <span className="text-xs font-mono text-slate-400 shrink-0 w-8 text-right">{concurrency}</span>
+            </div>
+            <p className="text-[11px] text-slate-500 mt-1">控制第一阶段多切片并行请求 Gemini 的并发窗口大小（默认 4）</p>
           </div>
 
           {/* FFmpeg custom path */}

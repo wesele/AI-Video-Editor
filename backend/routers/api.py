@@ -33,6 +33,7 @@ async def get_system_status():
             "has_api_key": bool(settings.get("gemini_api_key")),
             "api_key_masked": settings.get("gemini_api_key", "")[:4] + "****" if settings.get("gemini_api_key") else "",
             "default_model": settings.get("default_model"),
+            "default_concurrency": settings.get("default_concurrency", 4),
             "custom_ffmpeg_path": settings.get("custom_ffmpeg_path"),
         }
     }
@@ -125,6 +126,7 @@ async def _run_analysis(job_id: str, video_path: str, req: AnalyzeRequest):
             custom_prompt=req.custom_prompt,
             default_ff_speed=req.default_fast_forward_speed,
             resume=req.resume,
+            concurrency=req.concurrency,
             progress_callback=on_progress,
         )
         analyze_jobs[job_id] = {

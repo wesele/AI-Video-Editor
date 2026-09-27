@@ -55,25 +55,25 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             SmartVideoTheme {
-                var appSettings by remember { mutableStateOf(AppSettings()) }
+                var appSettings by remember { mutableStateOf(AppSettings.load(this@MainActivity)) }
 
                 MainScreen(
                     service = processingService,
                     settings = appSettings,
-                    onUpdateSettings = { appSettings = it }
+                    onUpdateSettings = { updated ->
+                        updated.save(this@MainActivity)
+                        appSettings = updated
+                    }
                 )
             }
         }
+        // 建立常驻服务连接（确保息屏时不会因 onStop 误掐断后台处理服务）
+        val serviceIntent = Intent(this, VideoProcessingService::class.java)
+        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    override fun onStart() {
-        super.onStart()
-        val intent = Intent(this, VideoProcessingService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-    }
-
-    override fun onStop() {
-        super.onStop()
+    override fun onDestroy() {
+        super.onDestroy()
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false

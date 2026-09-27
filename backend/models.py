@@ -33,6 +33,7 @@ class AnalyzeRequest(BaseModel):
     custom_prompt: Optional[str] = ""
     default_fast_forward_speed: float = 4.0
     resume: bool = False
+    concurrency: int = Field(4, ge=1, le=8, description="并发分析分段数 (1-8)")
 
 class ExportRequest(BaseModel):
     video_id: str
@@ -48,4 +49,5 @@ class SettingsPayload(BaseModel):
     gemini_base_url: str
     gemini_api_key: str
     default_model: str
+    default_concurrency: Optional[int] = Field(4, ge=1, le=8, description="默认并发分析分段数 (1-8)")
     custom_ffmpeg_path: Optional[str] = ""

@@ -15,6 +15,7 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
   const [stylePreset, setStylePreset] = useState('general');
   const [customPrompt, setCustomPrompt] = useState('');
   const [defaultSpeed, setDefaultSpeed] = useState(4.0);
+  const [concurrency, setConcurrency] = useState(systemStatus?.settings?.default_concurrency || 4);
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState('');
@@ -35,6 +36,7 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
           if (cfg.style_preset) setStylePreset(cfg.style_preset);
           if (cfg.custom_prompt !== undefined) setCustomPrompt(cfg.custom_prompt);
           if (cfg.default_fast_forward_speed) setDefaultSpeed(cfg.default_fast_forward_speed);
+          if (cfg.concurrency) setConcurrency(cfg.concurrency);
         }
         if (res.data.partial_segments && res.data.partial_segments.length > 0) {
           setStreamedCount(res.data.partial_segments.length);
@@ -97,6 +99,7 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
         style_preset: stylePreset,
         custom_prompt: customPrompt,
         default_fast_forward_speed: defaultSpeed,
+        concurrency: Number(concurrency) || 4,
         resume: resume,
       });
 
@@ -207,8 +210,8 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
         </div>
       </div>
 
-      {/* Speed & Custom Prompt Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {/* Speed, Concurrency & Custom Prompt Grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
         {/* Default Fast Forward Speed */}
         <div className="bg-slate-800/40 border border-slate-800 p-4 rounded-xl space-y-3">
           <label className="block text-xs font-semibold text-slate-300 flex items-center justify-between">
@@ -234,11 +237,51 @@ export default function GeminiPanel({ videoMeta, onAnalysisComplete, onPartialUp
               </button>
             ))}
           </div>
-          <p className="text-[11px] text-slate-500">无趣片段默认按该倍速快进播放</p>
+          <p className="text-[11px] text-slate-500">无趣片段默认按该倍速快进</p>
+        </div>
+
+        {/* Concurrency Threads (1-8) */}
+        <div className="bg-slate-800/40 border border-slate-800 p-4 rounded-xl space-y-3">
+          <label className="block text-xs font-semibold text-slate-300 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" /> 粗剪并发线程 (1-8)
+            </span>
+            <span className="text-emerald-400 font-bold font-mono">{concurrency} 线程</span>
+          </label>
+          <div className="grid grid-cols-4 gap-2">
+            {[1, 2, 4, 8].map(th => (
+              <button
+                key={th}
+                type="button"
+                onClick={() => setConcurrency(th)}
+                disabled={analyzing}
+                className={`py-1.5 rounded-lg text-xs font-mono font-medium border transition cursor-pointer ${
+                  concurrency === th
+                    ? 'bg-emerald-500 text-white border-emerald-400'
+                    : 'bg-slate-800 border-slate-700 text-slate-300 hover:border-slate-600'
+                }`}
+              >
+                {th}线程
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 pt-0.5">
+            <input
+              type="range"
+              min="1"
+              max="8"
+              step="1"
+              value={concurrency}
+              onChange={(e) => setConcurrency(parseInt(e.target.value, 10))}
+              disabled={analyzing}
+              className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+            />
+            <span className="text-[11px] font-mono text-slate-400 shrink-0">{concurrency}/8</span>
+          </div>
         </div>
 
         {/* Custom Instructions */}
-        <div className="md:col-span-2 bg-slate-800/40 border border-slate-800 p-4 rounded-xl space-y-2">
+        <div className="sm:col-span-2 md:col-span-2 bg-slate-800/40 border border-slate-800 p-4 rounded-xl space-y-2">
           <label className="block text-xs font-semibold text-slate-300">
             补充自定义指示 (可选)
           </label>

@@ -4,13 +4,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CallMerge
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -27,8 +27,11 @@ fun SegmentListView(
     segments: List<Segment>,
     onUpdateSegmentAction: (index: Int, action: String, speed: Float) -> Unit,
     onMergeWithNext: (index: Int) -> Unit,
+    onSeekToTime: ((Double) -> Unit)? = null,
+    onAdjustBoundary: ((index: Int, newStart: Double, newEnd: Double) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    var expandedTuneIndex by remember { mutableStateOf<Int?>(null) }
     fun formatSec(sec: Double): String {
         val m = (sec / 60).toInt()
         val s = sec % 60
@@ -80,13 +83,24 @@ fun SegmentListView(
                     .padding(vertical = 4.dp)
             ) {
                 Column(modifier = Modifier.padding(10.dp)) {
-                    // 顶部行：序号、时间范围、价值度徽章
+                    // 顶部行：序号、时间范围、价值度徽章与点击跳转预览
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { onSeekToTime?.invoke(seg.startTime) }
+                            .padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Default.PlayArrow,
+                                contentDescription = "Play",
+                                tint = Sky400,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = "#${index + 1}",
                                 fontSize = 11.sp,
@@ -102,9 +116,9 @@ fun SegmentListView(
                                 color = Color.White
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            val effSec = if (seg.action == "keep") seg.duration else if (seg.action == "fast_forward") (seg.duration / seg.speed) else 0.0
+                            val effSec = if (seg.action == "keep") seg.duration else if (seg.action == "fast_forward") (seg.duration / (if (seg.speed > 0f) seg.speed else 4.0f)) else 0.0
                             Text(
-                                text = "(${seg.duration.toInt()}s→${effSec.toInt()}s)",
+                                text = "(${String.format("%.1f", seg.duration)}s→${String.format("%.1f", effSec)}s)",
                                 fontSize = 10.sp,
                                 color = Slate400
                             )
@@ -139,15 +153,90 @@ fun SegmentListView(
                         )
                     }
 
+                    // 微调展开面板 (±0.5s 起止微调)
+                    if (expandedTuneIndex == index) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Slate900)
+                                .border(1.dp, Slate800, RoundedCornerShape(6.dp))
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("起点:", fontSize = 10.sp, color = Slate400)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Slate800)
+                                        .clickable {
+                                            val newStart = Math.max(0.0, Math.round((seg.startTime - 0.5) * 10.0) / 10.0)
+                                            onAdjustBoundary?.invoke(index, newStart, seg.endTime)
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Text("-0.5s", fontSize = 9.sp, color = Sky300, fontFamily = FontFamily.Monospace)
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Slate800)
+                                        .clickable {
+                                            val newStart = Math.min(seg.endTime - 0.2, Math.round((seg.startTime + 0.5) * 10.0) / 10.0)
+                                            onAdjustBoundary?.invoke(index, newStart, seg.endTime)
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Text("+0.5s", fontSize = 9.sp, color = Sky300, fontFamily = FontFamily.Monospace)
+                                }
+                            }
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("终点:", fontSize = 10.sp, color = Slate400)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Slate800)
+                                        .clickable {
+                                            val newEnd = Math.max(seg.startTime + 0.2, Math.round((seg.endTime - 0.5) * 10.0) / 10.0)
+                                            onAdjustBoundary?.invoke(index, seg.startTime, newEnd)
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Text("-0.5s", fontSize = 9.sp, color = Amber300, fontFamily = FontFamily.Monospace)
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Slate800)
+                                        .clickable {
+                                            val newEnd = Math.round((seg.endTime + 0.5) * 10.0) / 10.0
+                                            onAdjustBoundary?.invoke(index, seg.startTime, newEnd)
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Text("+0.5s", fontSize = 9.sp, color = Amber300, fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    // 底部操作栏：动作切换 Chips 与 合并按钮
+                    // 底部操作栏：动作切换 Chips 与 合并微调按钮
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                             // 保留
                             val isKeep = seg.action == "keep"
                             Box(
@@ -167,19 +256,39 @@ fun SegmentListView(
 
                             // 快进
                             val isFf = seg.action == "fast_forward"
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(if (isFf) Amber500 else Slate800)
-                                    .clickable { onUpdateSegmentAction(index, "fast_forward", 4.0f) }
-                                    .padding(horizontal = 8.dp, vertical = 3.dp)
-                            ) {
-                                Text(
-                                    text = "快进 4x",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (isFf) Color.White else Slate400
-                                )
+                            if (!isFf) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Slate800)
+                                        .clickable { onUpdateSegmentAction(index, "fast_forward", 4.0f) }
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) {
+                                    Text(
+                                        text = "快进",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Slate400
+                                    )
+                                }
+                            } else {
+                                listOf(2.0f, 4.0f, 8.0f).forEach { spd ->
+                                    val isCur = (seg.speed == spd)
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (isCur) Amber500 else Slate800)
+                                            .clickable { onUpdateSegmentAction(index, "fast_forward", spd) }
+                                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    ) {
+                                        Text(
+                                            text = "${spd.toInt()}x",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isCur) Color.White else Amber300
+                                        )
+                                    }
+                                }
                             }
 
                             // 删除
@@ -200,18 +309,36 @@ fun SegmentListView(
                             }
                         }
 
-                        // 合并到下一段
-                        if (index < segments.size - 1) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // 微调起止按钮
                             IconButton(
-                                onClick = { onMergeWithNext(index) },
+                                onClick = {
+                                    expandedTuneIndex = if (expandedTuneIndex == index) null else index
+                                },
                                 modifier = Modifier.size(26.dp)
                             ) {
                                 Icon(
-                                    Icons.Default.CallMerge,
-                                    contentDescription = "Merge",
-                                    tint = Slate400,
+                                    Icons.Default.Tune,
+                                    contentDescription = "Tune",
+                                    tint = if (expandedTuneIndex == index) Sky400 else Slate400,
                                     modifier = Modifier.size(16.dp)
                                 )
+                            }
+
+                            // 合并到下一段
+                            if (index < segments.size - 1) {
+                                Spacer(modifier = Modifier.width(2.dp))
+                                IconButton(
+                                    onClick = { onMergeWithNext(index) },
+                                    modifier = Modifier.size(26.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.CallMerge,
+                                        contentDescription = "Merge",
+                                        tint = Slate400,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
                     }

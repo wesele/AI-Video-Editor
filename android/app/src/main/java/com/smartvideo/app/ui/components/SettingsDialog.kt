@@ -26,6 +26,7 @@ fun SettingsDialog(
     var baseUrl by remember { mutableStateOf(currentSettings.geminiBaseUrl) }
     var apiKey by remember { mutableStateOf(currentSettings.geminiApiKey) }
     var selectedModel by remember { mutableStateOf(currentSettings.defaultModel) }
+    var concurrency by remember { mutableStateOf(currentSettings.concurrency.toFloat()) }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -103,7 +104,31 @@ fun SettingsDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(18.dp))
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 粗剪并发线程数 (1-8)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(text = "粗剪并发线程数 (1-8):", fontSize = 11.sp, color = Slate300)
+                    Text(text = "${concurrency.toInt()} 线程", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Sky400)
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+                Slider(
+                    value = concurrency,
+                    onValueChange = { concurrency = it },
+                    valueRange = 1f..8f,
+                    steps = 6,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Sky400,
+                        activeTrackColor = Sky500,
+                        inactiveTrackColor = Slate800
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 // 底部按钮
                 Row(
@@ -120,7 +145,8 @@ fun SettingsDialog(
                                 currentSettings.copy(
                                     geminiBaseUrl = baseUrl.trim(),
                                     geminiApiKey = apiKey.trim(),
-                                    defaultModel = selectedModel
+                                    defaultModel = selectedModel,
+                                    concurrency = concurrency.toInt().coerceIn(1, 8)
                                 )
                             )
                             onDismiss()
